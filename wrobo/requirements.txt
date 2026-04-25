@@ -1,0 +1,8 @@
+h5py
+opencv-python
+numpy
+tqdm
+opencv-python
+torch=2.11
+torchvision
+tensorboard
