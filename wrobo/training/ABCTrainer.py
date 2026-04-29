@@ -654,24 +654,38 @@ class DDPABCTrainer(ABC):
                 # ---------- train ----------
                 self.train_epoch_start(epoch)
                 train_outputs = []
-                for _ in tqdm(
+                tr_pbar = tqdm(
                     range(self.tr_iterations_per_epoch),
                     disable=(self.rank != 0) or self.verbose,
-                ):
+                    desc="Train",
+                    dynamic_ncols=True,
+                )
+                for _ in tr_pbar:
                     batch = next(self.train_iter)
-                    train_outputs.append(self.train_step(batch))
+                    loss_dict = self.train_step(batch)
+                    train_outputs.append(loss_dict)
+
+                    postfix = {k: f"{v:.4f}" for k, v in loss_dict.items()}
+                    tr_pbar.set_postfix(postfix, refresh=True)
                 self.train_epoch_end(train_outputs, epoch)
 
                 # ---------- validate ----------
                 with torch.no_grad():
                     self.validation_epoch_start()
                     val_outputs = []
-                    for _ in tqdm(
+                    val_pbar = tqdm(
                         range(self.val_iterations_per_epoch),
                         disable=(self.rank != 0) or self.verbose,
-                    ):
+                        desc="Val",
+                        dynamic_ncols=True,
+                    )
+                    for _ in val_pbar:
                         batch = next(self.val_iter)
-                        val_outputs.append(self.validation_step(batch))
+                        loss_dict = self.validation_step(batch)
+                        val_outputs.append(loss_dict)
+
+                        postfix = {k: f"{v:.4f}" for k, v in loss_dict.items()}
+                        val_pbar.set_postfix(postfix, refresh=True)
                     self.validation_epoch_end(val_outputs, epoch)
 
                 self.epoch_end(epoch)
@@ -767,9 +781,11 @@ class DDPABCTrainer(ABC):
             self.print_to_log_file("train_loss", np.round(train_loss, decimals=4))
             self.print_to_log_file("val_loss", np.round(val_loss, decimals=4))
 
-            self.print_to_log_file(
-                f"Epoch time: {np.round(self._get_latest('epoch_end_timestamps') - self._get_latest('epoch_start_timestamps'), decimals=2)} s"
+            epoch_time = self._get_latest("epoch_end_timestamps") - self._get_latest(
+                "epoch_start_timestamps"
             )
+            self.print_to_log_file(f"Epoch time: {np.round(epoch_time, decimals=2)} s")
+            self.logger.log("Epoch_time", epoch_time, epoch)
 
             # handling periodic checkpointing
             if (epoch + 1) % self.save_every == 0 and epoch != (self.num_epoch - 1):

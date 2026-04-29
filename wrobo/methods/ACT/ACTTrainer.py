@@ -110,7 +110,9 @@ class ACTTrainer(DDPABCTrainer):
         self.logger = self.get_logger()
         self._best_ema = None
         self.ema_decay = getattr(self, "ema_decay", 0.9)
-        self.norm_stats = open_json(os.path.join(self.logs_output_folder, "norm_stats.json"))
+        self.norm_stats = open_json(
+            os.path.join(self.logs_output_folder, "norm_stats.json")
+        )
 
         if self.continue_train:
             checkpoint = os.path.join(self.logs_output_folder, "checkpoint_latest.pth")
@@ -293,7 +295,7 @@ class ACTTrainer(DDPABCTrainer):
         # throughout the entire training process cannot cover all the images in the val set.
         val_sampler = self.build_sampler(val_dataset)
 
-        this_num_workers = self.num_workers // self.world_size
+        this_num_workers = max(1, self.num_workers // self.world_size)
 
         train_loader = DataLoader(
             train_dataset,
@@ -306,7 +308,7 @@ class ACTTrainer(DDPABCTrainer):
             persistent_workers=True,
             worker_init_fn=self.worker_init_fn,
             drop_last=True,
-            prefetch_factor=3,
+            prefetch_factor=max(1, 3 - (self.batch_size // 64)),
         )
 
         val_loader = DataLoader(
@@ -319,7 +321,7 @@ class ACTTrainer(DDPABCTrainer):
             pin_memory=self.device.type == "cuda",
             persistent_workers=True,
             drop_last=True,
-            prefetch_factor=2,
+            prefetch_factor=max(1, 2 - (self.batch_size // 64)),
         )
 
         return train_loader, val_loader
@@ -362,6 +364,7 @@ class ACTTrainer(DDPABCTrainer):
             # mean over batch, sum over dimensions
             kl_ = -0.5 * (1 + logvar - mu.pow(2) - logvar.exp()).sum(dim=1).mean(dim=0)
 
+            # assert not (torch.isnan(l1_) or torch.isnan(kl_)), f"L1: {l1_}. KL: {kl_}"
             l = l1_ + self.w_KL * kl_
 
         if self.grad_scaler is not None:
