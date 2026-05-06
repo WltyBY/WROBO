@@ -98,8 +98,8 @@ def print_h5_structure(filename):
         print(f"📁 HDF5 file: {filename}")
         if f.attrs:
             str_attrs = str(dict(f.attrs))
-            if len(str_attrs) > 100:
-                str_attrs = str_attrs[:100] + " ... (truncated)"
+            if len(str_attrs) > 150:
+                str_attrs = str_attrs[:150] + " ... (truncated)"
         else:
             str_attrs = "No attributes"
         print(f"├── [Attr]: {str_attrs}")

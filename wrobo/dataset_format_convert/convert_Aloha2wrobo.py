@@ -19,6 +19,8 @@ def convert_hdf5_format(src_path, dst_path, comment, dataset_name="ACT", success
         # images: (T, H, W, C) -> (T, C, H, W)
         img_src = src["observations/images/top"][:]  # shape: (T, H, W, C)
         T, H, W, C = img_src.shape
+        dst.attrs["seq_len"] = T
+
         img_target = np.transpose(img_src, (0, 3, 1, 2))  # (T, C, H, W)
         obs_grp.create_dataset(
             "image_top",
@@ -27,7 +29,7 @@ def convert_hdf5_format(src_path, dst_path, comment, dataset_name="ACT", success
             compression="gzip",
             compression_opts=4,
             shuffle=True,
-            chunks=(1, 3, 480, 640),
+            chunks=(1, C, H, W),
         )
 
         # qpos -> proprio_state
@@ -57,7 +59,7 @@ def convert_hdf5_format(src_path, dst_path, comment, dataset_name="ACT", success
 
         action = src["action"][:]
         dst.create_dataset(
-            "action_absolute",
+            "action_abs",
             data=action,
             dtype="float32",
             compression="gzip",

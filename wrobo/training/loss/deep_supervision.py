@@ -24,7 +24,7 @@ class DeepSupervisionWeightedSummator(nn.Module):
             weights = [1] * len(args[0])
         else:
             weights = self.weight
-
+        
         # initialize the loss like this instead of 0 to ensure it sits on the correct device, not sure if that's
         # really necessary
         l = weights[0] * self.loss(*[j[0] for j in args])

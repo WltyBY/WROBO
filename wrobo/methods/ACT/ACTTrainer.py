@@ -1,8 +1,6 @@
 import os
 import torch
 
-import torch.distributed as dist
-
 from datetime import datetime
 from torch import GradScaler, optim, nn, autocast
 from torchvision import transforms
@@ -12,7 +10,6 @@ from wrobo.methods.ACT.models.policy import ACTPolicy
 from wrobo.training.ABCTrainer import DDPABCTrainer
 from wrobo.utils.file_operations import copy_file_to_dstFolder, open_json
 from wrobo.utils.load_model_weights import load_pretrained_weights
-from wrobo.training.loss.entropy_loss import KLDivLoss
 from wrobo.training.lr_scheduler.ConstantLR import ConstantLRScheduler
 from wrobo.training.dataset.episodic_dataset import EpisodicDataset
 from wrobo.training.dataloader.sampler import InfiniteSampler
@@ -24,9 +21,8 @@ class ACTTrainer(DDPABCTrainer):
     def __init__(
         self,
         training_args,
-        verbose: bool = False,
+        verbose: bool = True,
     ):
-        self.training_args = training_args
         self.verbose = verbose
 
         self.was_initialized = False
@@ -34,8 +30,8 @@ class ACTTrainer(DDPABCTrainer):
         self.save_every = 1
         self.disable_checkpointing = False
 
-        self.get_default_training_args()
-        self.get_custom_training_args()
+        self.get_default_training_args(training_args)
+        self.get_custom_training_args(training_args)
 
         self.device = self.get_device()
 
@@ -136,7 +132,7 @@ class ACTTrainer(DDPABCTrainer):
             self.setting_check()
 
             # build network
-            self.network = self.get_networks(self.config_dict["Policy"])
+            self.network = self.get_policy(self.config_dict["Policy"])
             if self.pretrained_weight is not None:
                 if self.is_main_process():
                     self.print_to_log_file(
@@ -185,10 +181,11 @@ class ACTTrainer(DDPABCTrainer):
         lr_scheduler = ConstantLRScheduler(optimizer, warmup_steps=self.warmup_epoch)
         return optimizer, lr_scheduler
 
-    def get_custom_training_args(self):
-        self.w_KL = self.training_args.w_KL
+    def get_custom_training_args(self, training_args):
+        self.w_KL = training_args.w_KL
 
-    def get_networks(self, policy_config):
+    @staticmethod
+    def get_policy(policy_config):
         return ACTPolicy(policy_config)
 
     def get_training_img_transforms(self):
@@ -329,7 +326,7 @@ class ACTTrainer(DDPABCTrainer):
     def train_step(self, batch):
         images = batch["image"]
         proprio_states = batch["proprio_state"]
-        actions = batch["action_absolute"]
+        actions = batch["action_abs"]
         is_pad = batch["is_pad"]
 
         # to device
@@ -388,7 +385,7 @@ class ACTTrainer(DDPABCTrainer):
     def validation_step(self, batch):
         images = batch["image"]
         proprio_states = batch["proprio_state"]
-        actions = batch["action_absolute"]
+        actions = batch["action_abs"]
         is_pad = batch["is_pad"]
 
         # to device

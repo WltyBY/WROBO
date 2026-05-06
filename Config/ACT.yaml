@@ -1,0 +1,29 @@
+Policy:
+  backbone_name: ResNet18
+  backbone_weights_name: DEFAULT
+  history_width: 1
+  action_chunk_size: 100
+  proprio_dim: 14
+  env_dim: None
+  z_dim: 32
+  embed_dim: 512
+  nhead: 8
+  num_encoder_layers: 4
+  num_decoder_layers: 7
+  FFN_dim: 2048
+  dropout: 0.1
+  activation: relu
+  pre_norm: False
+  deep_supervision: False
+
+Training_settings:
+  data_keys: [observations/image_top, observations/proprio_state, action_abs]
+  # iter number to train per epoch
+  tr_iterations_per_epoch: 250
+  # iter number to train per epoch
+  val_iterations_per_epoch: 50
+  # settings of optimizer
+  base_lr: 1.0e-5
+  weight_decay: 1.0e-4
+  # bias towards sampling later timesteps, which have more future and complex actions
+  biased_sample: False

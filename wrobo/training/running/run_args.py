@@ -28,7 +28,7 @@ def build_train_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--config_file",
         type=str,
-        help="Path of config yaml, which contains setting of networks, etc.",
+        help="Path of config yaml, which contains setting of Policy, etc.",
         required=True,
     )
     p.add_argument(

@@ -50,12 +50,11 @@ class DDPABCTrainer(ABC):
     - validation_step(self, batch)
     """
 
-    def __init__(self, training_args, verbose=False):
+    def __init__(self, training_args, verbose=True):
         """
         Don't call this constructor directly by super.init().
         Just copy and rewrite the code in __init__() in the corresponding Trainer.
         """
-        self.training_args = training_args
         self.verbose = verbose
 
         self.was_initialized = False
@@ -63,8 +62,8 @@ class DDPABCTrainer(ABC):
         self.save_every = 1
         self.disable_checkpointing = False
 
-        self.get_default_training_args()
-        self.get_custom_training_args()
+        self.get_default_training_args(training_args)
+        self.get_custom_training_args(training_args)
 
         self.device = self.get_device()
 
@@ -215,15 +214,15 @@ class DDPABCTrainer(ABC):
         pass
 
     @abstractmethod
-    def get_custom_training_args(self):
+    def get_custom_training_args(self, training_args):
         """
         Get custom training args in train.py in the corresponding method.
-        self.training_args
+        training_args
         """
         pass
 
     @abstractmethod
-    def get_networks(self, network_settings: dict) -> nn.Module:
+    def get_policy(self, policy_config: dict) -> nn.Module:
         pass
 
     @abstractmethod
@@ -393,25 +392,25 @@ class DDPABCTrainer(ABC):
 
         return model
 
-    def get_default_training_args(self):
+    def get_default_training_args(self, training_args):
         """
         Get default training args in run_args.py.
         self.training_args
         """
-        self.dataset_dir = self.training_args.dataset_dir
-        self.log_dir = self.training_args.log_dir
-        self.config_file = self.training_args.config_file
-        self.fold = self.training_args.fold
-        self.method_name = self.training_args.method_name
-        self.num_epoch = self.training_args.num_epoch
-        self.warmup_epoch = self.training_args.warmup_epoch
-        self.batch_size = self.training_args.batch_size
-        self.args_gpu = self.training_args.gpu
-        self.continue_train = self.training_args.continue_train
-        self.pretrained_weight = self.training_args.pretrained_weight
-        self.num_workers = self.training_args.num_workers
-        self.random_seed = self.training_args.seed
-        self.deterministic = self.training_args.no_deterministic
+        self.dataset_dir = training_args.dataset_dir
+        self.log_dir = training_args.log_dir
+        self.config_file = training_args.config_file
+        self.fold = training_args.fold
+        self.method_name = training_args.method_name
+        self.num_epoch = training_args.num_epoch
+        self.warmup_epoch = training_args.warmup_epoch
+        self.batch_size = training_args.batch_size
+        self.args_gpu = training_args.gpu
+        self.continue_train = training_args.continue_train
+        self.pretrained_weight = training_args.pretrained_weight
+        self.num_workers = training_args.num_workers
+        self.random_seed = training_args.seed
+        self.deterministic = training_args.no_deterministic
 
         self.config_dict = open_yaml(self.config_file)
         self.tr_iterations_per_epoch = self.config_dict["Training_settings"].get(
@@ -434,7 +433,7 @@ class DDPABCTrainer(ABC):
         if self.args_gpu:
             os.environ["CUDA_VISIBLE_DEVICES"] = ",".join(map(str, self.args_gpu))
 
-        use_cuda = torch.cuda.is_available() and self.args_gpu != []
+        use_cuda = torch.cuda.is_available() and (self.args_gpu != [])
 
         ddp = int(os.environ.get("WORLD_SIZE", 1)) > 1 and use_cuda
 
@@ -527,7 +526,7 @@ class DDPABCTrainer(ABC):
             print(*args)
 
     def setting_check(self):
-        model_setting_name = self.config_dict.get("Policy", "Network")
+        model_setting_name = self.config_dict["Policy"]
         if (
             model_setting_name.__contains__("activate")
             and model_setting_name["activate"].lower() == "prelu"
@@ -656,7 +655,7 @@ class DDPABCTrainer(ABC):
                 train_outputs = []
                 tr_pbar = tqdm(
                     range(self.tr_iterations_per_epoch),
-                    disable=(self.rank != 0) or self.verbose,
+                    disable=(self.rank != 0) or not self.verbose,
                     desc="Train",
                     dynamic_ncols=True,
                 )
@@ -675,7 +674,7 @@ class DDPABCTrainer(ABC):
                     val_outputs = []
                     val_pbar = tqdm(
                         range(self.val_iterations_per_epoch),
-                        disable=(self.rank != 0) or self.verbose,
+                        disable=(self.rank != 0) or not self.verbose,
                         desc="Val",
                         dynamic_ncols=True,
                     )

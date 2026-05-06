@@ -396,6 +396,7 @@ class DETRVAE(nn.Module):
         self.env_dim = env_dim
         self.z_dim = z_dim
         self.action_chunk_size = action_chunk_size
+        self.return_intermediate_decoder = return_intermediate_decoder
 
         self.encoder = TransformerEncoder(
             num_layers=num_encoder_layers,
@@ -459,8 +460,16 @@ class DETRVAE(nn.Module):
         # learned position embedding for proprio and latent
         self.proprio_z_pos_embed = nn.Embedding(2, embed_dim)
         self.action_chunk_embed = nn.Embedding(action_chunk_size, embed_dim)
-        self.action_head = nn.Linear(embed_dim, proprio_dim)
-        self.is_pad_head = nn.Linear(embed_dim, 1)
+        if self.return_intermediate_decoder:
+            self.action_heads = nn.ModuleList(
+                [nn.Linear(embed_dim, proprio_dim) for _ in range(num_decoder_layers)]
+            )
+            self.is_pad_heads = nn.ModuleList(
+                [nn.Linear(embed_dim, 1) for _ in range(num_decoder_layers)]
+            )
+        else:
+            self.action_head = nn.Linear(embed_dim, proprio_dim)
+            self.is_pad_head = nn.Linear(embed_dim, 1)
 
     def reparametrize(self, mu, logvar):
         std = torch.exp(0.5 * logvar)
@@ -573,13 +582,21 @@ class DETRVAE(nn.Module):
 
                 pos = pos + t_embed
 
-                all_cam_features.append(features.flatten(3))  # (bs, his_width, embed_dim, height'*width')
-                all_cam_pos.append(pos.flatten(3))  # (bs, his_width, embed_dim, height'*width')
+                all_cam_features.append(
+                    features.flatten(3)
+                )  # (bs, his_width, embed_dim, height'*width')
+                all_cam_pos.append(
+                    pos.flatten(3)
+                )  # (bs, his_width, embed_dim, height'*width')
 
             # fold camera dimension into width dimension
             # all_cam_features: [(bs, his_width*H*W, embed_dim), ...] -> (bs, his_width, num_cam, embed_dim, H*W)
-            cam_features = torch.stack(all_cam_features, axis=2).transpose(-1, -2).flatten(1, 3)  # (bs, his_width*num_cam*H*W, embed_dim)
-            cam_pos = torch.stack(all_cam_pos, axis=2).transpose(-1, -2).flatten(1, 3)  # (bs, his_width*num_cam*H*W, embed_dim)
+            cam_features = (
+                torch.stack(all_cam_features, axis=2).transpose(-1, -2).flatten(1, 3)
+            )  # (bs, his_width*num_cam*H*W, embed_dim)
+            cam_pos = (
+                torch.stack(all_cam_pos, axis=2).transpose(-1, -2).flatten(1, 3)
+            )  # (bs, his_width*num_cam*H*W, embed_dim)
 
             # (action_chunk_size, embed_dim) -> (bs, action_chunk_size, embed_dim)
             AC_pos_embed = self.action_chunk_embed.weight[None].repeat(bs, 1, 1)
@@ -649,6 +666,10 @@ class DETRVAE(nn.Module):
             )[0]
 
         # (num_layers, batch_size, seq_de, embed_dim) -> (num_layers, batch_size, seq_de, proprio_dim)
-        a_hat = [self.action_head(h) for h in hs]
-        is_pad_hat = [self.is_pad_head(h) for h in hs]
+        if self.return_intermediate_decoder:
+            a_hat = [self.action_heads[i](h) for i, h in enumerate(hs)]
+            is_pad_hat = [self.is_pad_heads[i](h) for i, h in enumerate(hs)]
+        else:
+            a_hat = self.action_head(hs)
+            is_pad_hat = self.is_pad_head(hs)
         return a_hat, is_pad_hat, [mu, logvar]

@@ -17,7 +17,9 @@ class ACTPolicy(nn.Module):
             backbone_weights_name=config["backbone_weights_name"],
         )
         self.pe = SinePositionEmbedding2D(self.config["embed_dim"])
-        self.model = DETRVAE(backbone=backbone, backbone_PE=self.pe,  **self.get_model_settings())
+        self.model = DETRVAE(
+            backbone=backbone, backbone_PE=self.pe, **self.get_model_settings()
+        )
 
     def forward(self, image, proprio_state, actions=None, is_pad=None):
         if actions is not None:  # Training time
@@ -30,12 +32,20 @@ class ACTPolicy(nn.Module):
                 actions=actions,
                 is_pad=is_pad,
             )
-            return {"action_chunk": a_hat, "mu": mu, "logvar": logvar}
+            return {
+                "action_chunk": a_hat,
+                "mu": mu,
+                "logvar": logvar,
+                "pred": a_hat[0] if isinstance(a_hat, list) else a_hat,
+            }
         else:  # inference time
             a_hat, _, (_, _) = self.model(
                 image=image, proprio_state=proprio_state, env_state=None
             )  # no action, sample from prior
-            return {"action_chunk": a_hat}
+            return {
+                "action_chunk": a_hat,
+                "pred": a_hat[0] if isinstance(a_hat, list) else a_hat,
+            }
 
     def get_model_settings(self):
         return {

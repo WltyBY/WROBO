@@ -14,17 +14,17 @@ from wrobo.utils.file_operations import open_json
 class EpisodicDataset(Dataset):
     """
     each episode is stored in a separate HDF5 file, with the following structure:
-    ├── attrs: {"dataset": "ACT", "success": True, "comment": "<comment>", ...}
+    ├── attrs: {"dataset": "ACT", "seq_len": T, "success": True, "comment": "<comment>", ...}
     ├── observations (Group)        # images
     │   ├── image_wrist (Dataset)   # [T, C, H, W] - uint8
-    │   ├── image_third (Dataset)   # [T, C, H, W] - uint8
+    │   ├── image_top (Dataset)     # [T, C, H, W] - uint8
     │   ├── proprio_state (Dataset) # proprioceptive state, [T, D1] - float32
     │   └── ... (other datasets, e.g. "proprio_vel", other cameras, etc.)
-    ├── action_absolute (Dataset)  # absolute action sequence, [T, D2] - float32
-    ├── action_relative (Dataset)  # relative action sequence, [T, D1] - float32
-    └── ... (other datasets, e.g. "rewards", etc.)
+    ├── action_abs (Dataset)        # absolute action sequence, [T, D1] - float32
+    ├── action_rel (Dataset)        # relative action sequence, [T, D1] - float32
+    └── ... (other datasets, e.g. "ee_pos_abs", "ee_pos_rel", "rewards", etc.)
 
-    data_keys: e.g. ["observations/image_wrist", "observations/image_front", "observations/proprio_state", "action_absolute", ...]
+    data_keys: e.g. ["observations/image_wrist", "observations/image_top", "observations/proprio_state", "action_abs", ...]
     """
 
     def __init__(
@@ -75,8 +75,7 @@ class EpisodicDataset(Dataset):
 
         data_dict = dict()
         root = self._get_h5_file(episode_path)
-        original_action_shape = root["/action_absolute"].shape
-        episode_len = original_action_shape[0]
+        episode_len = dict(root.attrs)["seq_len"]
 
         # sample a timestep
         if self.biased_sample:
@@ -85,18 +84,18 @@ class EpisodicDataset(Dataset):
             sample_ts = int(u * (episode_len - 1))
         else:
             sample_ts = np.random.randint(episode_len)
-
+            
         for key in self.data_keys:
             # assert (
             #     "/" + key in root
             # ), f"Key {key} not found in episode file {episode_path}, available keys: {[k for k in root.keys()]}"
 
             if key.startswith("observations"):
-                # Observations are no need for chunking, just load the data at start_ts
                 obs_seq = root["/" + key]
 
                 start_idx = sample_ts - self.history_width + 1
                 end_idx = sample_ts + 1
+
                 if start_idx < 0:
                     pad_len = -start_idx
                     start_idx = 0
@@ -118,6 +117,7 @@ class EpisodicDataset(Dataset):
                     obs = torch.from_numpy(
                         obs_chunk
                     )  # / 255.0 is no need, while using transforms.ToTensor().
+
                     if self.img_transforms:
                         obs = torch.stack([self.img_transforms(frame) for frame in obs])
                     else:
@@ -154,6 +154,10 @@ class EpisodicDataset(Dataset):
                     mean = np.asarray(self.norm_stats[key]["mean"])
                     std = np.asarray(self.norm_stats[key]["std"])
                     padded_action = (padded_action - mean) / (std + 1e-6)
+                else:
+                    print(
+                        f"Warning: no normalization stats for key {key}, using unnormalized data. Please check if this is intended."
+                    )
 
                 data_dict[key] = torch.from_numpy(padded_action).float()
                 if "is_pad" not in data_dict:
@@ -166,7 +170,7 @@ class EpisodicDataset(Dataset):
             data_dict["image"] = torch.stack(image_lst, dim=0)
             for key in self.cam_keys:
                 del data_dict[key]
-
+        
         return data_dict
 
     def _get_episode_ids(self):
