@@ -271,7 +271,7 @@ class AlohaEvaluator:
                     actions_for_curr_step = all_time_actions[
                         :, t
                     ]  # (max_timesteps, action_dim)
-                    mask = (actions_for_curr_step != 0).all(dim=1)  # 非零且完整填充
+                    mask = (actions_for_curr_step != 0).all(dim=1)
                     actions_for_curr_step = actions_for_curr_step[mask]
                     if len(actions_for_curr_step) > 0:
                         k = 0.01
@@ -288,10 +288,6 @@ class AlohaEvaluator:
                 else:
                     raw_action = all_actions[:, t % query_frequency]
 
-                    # print("k=", t % query_frequency)
-                    # print("first action:", all_actions[0,0][:3])
-                    # print("used action:", all_actions[0, t % query_frequency][:3])
-
                 raw_action_np = raw_action.squeeze(0).cpu().numpy()
                 action = self._post_process(raw_action_np, "action_abs")
                 ts = self.env.step(action)
@@ -304,7 +300,6 @@ class AlohaEvaluator:
                 plt.close(fig)
                 plt.ioff()
 
-            # 计算当前 rollout 的累计奖励和最高奖励
             rewards_arr = np.array(rewards)
             episode_return = np.sum(rewards_arr[rewards_arr != None])
             highest_reward = np.max(rewards_arr)
@@ -324,11 +319,9 @@ class AlohaEvaluator:
                 )
                 self._save_videos(image_list, DT, video_path=video_path)
 
-        # 统计成功率
         success_rate = np.mean(np.array(highest_rewards) == self.env_max_reward)
         avg_return = np.mean(episode_returns)
 
-        # 详细报告各奖励阈值的达成比例
         self.print_to_log_file(f"\nSuccess rate: {success_rate:.2%}")
         self.print_to_log_file(f"Average return: {avg_return:.2f}\n")
         reward_distribution = {}
