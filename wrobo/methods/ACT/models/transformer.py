@@ -556,7 +556,6 @@ class DETRVAE(nn.Module):
                 cam_imgs = cam_imgs.flatten(
                     0, 1
                 )  # (bs*his_width, channel, height, width)
-
                 features = self.backbone(cam_imgs)[
                     "4"
                 ]  # take the last layer (layer_4) feature
@@ -620,7 +619,7 @@ class DETRVAE(nn.Module):
                 bs, 1, 1
             )  # bs, his_width+1, embed_dim
 
-            # formulate input of tranformer
+            # formulate input of transformer
             input = torch.cat([cam_features, proprio_input, z], axis=1)
             pos = torch.cat([cam_pos, proprio_z_pos_embed], axis=1)
 

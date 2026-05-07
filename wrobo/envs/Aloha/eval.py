@@ -1,8 +1,6 @@
 import os
 
-os.environ["MUJOCO_GL"] = "osmesa"
-# os.environ["PYOPENGL_PLATFORM"] = "osmesa"
-# os.environ["PYOPENGL_NO_ACCELERATE"] = "1"
+os.environ["MUJOCO_GL"] = "egl"
 
 import cv2
 import torch
@@ -14,6 +12,8 @@ import matplotlib.pyplot as plt
 
 from typing import Dict, Any, Tuple, List, Optional
 from torchvision import transforms
+from time import time, sleep
+from datetime import datetime
 
 from wrobo.envs.Aloha.utils.constants import DT
 from wrobo.envs.Aloha.utils.sim_envs import make_sim_env, BOX_POSE
@@ -37,10 +37,16 @@ class AlohaEvaluator:
         self.init_random()
         self.get_norm_stats()
         self.device = self.get_device()
-        self.img_transform = self.get_img_tranform()
+        self.img_transform = self.get_img_transform()
 
-        self.out_dir = os.path.join(self.log_dir, "evaluation")
-        os.makedirs(self.out_dir, exist_ok=True)
+        self.eval_log_dir = os.path.join(
+            self.log_dir,
+            f"evaluation_{self.ckpt_name.replace('.pth', '')}_temporal_agg_{self.temporal_agg}",
+        )
+        os.makedirs(self.eval_log_dir, exist_ok=True)
+        self.log_file = os.path.join(self.eval_log_dir, "log.txt")
+        with open(self.log_file, "w"):
+            pass  # create or clear log file
 
         self._load_model()
 
@@ -57,6 +63,7 @@ class AlohaEvaluator:
         self.max_timesteps = eval_args.max_timesteps
         self.onscreen_render = eval_args.onscreen_render
         self.args_gpu = eval_args.gpu
+        self.temporal_agg = eval_args.temporal_agg
         self.random_seed = eval_args.seed
 
         self.config_dict = open_yaml(
@@ -83,11 +90,11 @@ class AlohaEvaluator:
     def get_norm_stats(self):
         self.norm_stats = open_json(os.path.join(self.log_dir, "norm_stats.json"))
 
-    def get_img_tranform(self):
+    def get_img_transform(self):
         return transforms.Compose(
             [
                 transforms.ToPILImage(),
-                transforms.Resize((224, 224)),
+                # transforms.Resize((224, 224)),
                 transforms.ToTensor(),
                 transforms.Normalize(
                     mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]
@@ -113,6 +120,7 @@ class AlohaEvaluator:
 
     def _load_model(self) -> None:
         self.policy = ACTTrainer.get_policy(self.policy_config)
+        self.state_dim = self.policy.config["proprio_dim"]
         load_pretrained_weights(self.policy, os.path.join(self.log_dir, self.ckpt_name))
 
         self.policy.to(self.device)
@@ -123,7 +131,7 @@ class AlohaEvaluator:
         self.policy.eval()
 
     def _init_env(self) -> None:
-        self.env = make_sim_env(self.task_name, None)
+        self.env = make_sim_env(self.task_name, self.random_seed)
         self.env_max_reward = self.env.task.max_reward
 
     def _pre_process(self, data: np.ndarray, key: str) -> np.ndarray:
@@ -180,18 +188,10 @@ class AlohaEvaluator:
         onscreen_cam: str = "image_angle",
         save_episode: bool = True,
     ) -> Dict[str, float]:
-        """
-        Args:
-            onscreen_render: 是否实时渲染（覆盖 config 中的设置）
-
-        Returns:
-            Dict:
-                - success_rate: 达到最大奖励（任务成功）的比例
-                - avg_return: 平均累计奖励
-                - reward_distribution: 各奖励阈值以上的次数和比例
-        """
-
-        query_frequency = self.policy_config.get("action_chunk_size", 1)
+        query_frequency = self.policy_config["action_chunk_size"]
+        if self.temporal_agg:
+            num_queries = self.policy_config["action_chunk_size"]
+            query_frequency = 1
 
         episode_returns = []
         highest_rewards = []
@@ -210,18 +210,16 @@ class AlohaEvaluator:
                     )
                 )
 
-            # 时序聚合缓冲区
-            # if self.temporal_agg:
-            #     all_time_actions = torch.zeros(
-            #         [
-            #             self.max_timesteps,
-            #             self.max_timesteps + num_queries,
-            #             self.state_dim,
-            #         ],
-            #         device=self.device,
-            #     )
+            if self.temporal_agg:
+                all_time_actions = torch.zeros(
+                    [
+                        self.max_timesteps,
+                        self.max_timesteps + num_queries,
+                        self.state_dim,
+                    ],
+                    device=self.device,
+                )
 
-            # 存储可视化数据
             image_list = []
             qpos_list = []
             target_qpos_list = []
@@ -249,7 +247,7 @@ class AlohaEvaluator:
                     torch.from_numpy(proprio_state_norm).float().to(self.device)[None]
                 )  # (1, 1, state_dim) -> (bs, his_width, state_dim)
 
-                # 获取当前图像
+                # prepare image tensor for policy
                 curr_images = []
                 for cam_name in self.img_keys:
                     curr_image = ts.observation[cam_name]
@@ -268,8 +266,7 @@ class AlohaEvaluator:
                         "pred"
                     ]  # (1, action_chunk_size, action_dim)
 
-                if False:
-                    # if self.temporal_agg:
+                if self.temporal_agg:
                     all_time_actions[[t], t : t + num_queries] = all_actions
                     actions_for_curr_step = all_time_actions[
                         :, t
@@ -298,13 +295,11 @@ class AlohaEvaluator:
                 raw_action_np = raw_action.squeeze(0).cpu().numpy()
                 action = self._post_process(raw_action_np, "action_abs")
                 ts = self.env.step(action)
-                print("qpos:", proprio_state_np[:3])
-                print("action:", action[:3])
 
                 qpos_list.append(proprio_state_np)
                 target_qpos_list.append(action)
                 rewards.append(ts.reward)
-                
+
             if self.onscreen_render:
                 plt.close(fig)
                 plt.ioff()
@@ -316,7 +311,7 @@ class AlohaEvaluator:
             episode_returns.append(episode_return)
             highest_rewards.append(highest_reward)
 
-            print(
+            self.print_to_log_file(
                 f"Rollout {rollout_id:2d}: return = {episode_return:6.2f}, "
                 f"highest_reward = {highest_reward}, max_reward = {self.env_max_reward}, "
                 f"success = {highest_reward == self.env_max_reward}"
@@ -324,8 +319,8 @@ class AlohaEvaluator:
 
             if save_episode:
                 video_path = os.path.join(
-                    self.out_dir,
-                    f"video_{self.ckpt_name.replace('.pth', '')}_rollout{rollout_id}.mp4",
+                    self.eval_log_dir,
+                    f"video_rollout{rollout_id}.mp4",
                 )
                 self._save_videos(image_list, DT, video_path=video_path)
 
@@ -334,13 +329,15 @@ class AlohaEvaluator:
         avg_return = np.mean(episode_returns)
 
         # 详细报告各奖励阈值的达成比例
-        print(f"\nSuccess rate: {success_rate:.2%}")
-        print(f"Average return: {avg_return:.2f}\n")
+        self.print_to_log_file(f"\nSuccess rate: {success_rate:.2%}")
+        self.print_to_log_file(f"Average return: {avg_return:.2f}\n")
         reward_distribution = {}
         for r in range(self.env_max_reward + 1):
             count = sum(hr >= r for hr in highest_rewards)
             rate = count / self.num_rollouts
-            print(f"Reward >= {r}: {count}/{self.num_rollouts} = {rate:.2%}")
+            self.print_to_log_file(
+                f"Reward >= {r}: {count}/{self.num_rollouts} = {rate:.2%}"
+            )
             reward_distribution[r] = {"count": count, "rate": rate}
 
         return {
@@ -350,6 +347,22 @@ class AlohaEvaluator:
             "episode_returns": episode_returns,
             "highest_rewards": highest_rewards,
         }
+
+    def print_to_log_file(self, *args, also_print_to_console=True, add_timestamp=True):
+        timestamp = time()
+        if add_timestamp:
+            args = (f"{datetime.fromtimestamp(timestamp)}:", *args)
+
+        for _ in range(5):
+            try:
+                with open(self.log_file, "a+") as f:
+                    f.write(" ".join(map(str, args)) + "\n")
+                break
+            except IOError:
+                sleep(0.5)
+
+        if also_print_to_console:
+            print(*args)
 
 
 def parse_device(v):
@@ -413,7 +426,11 @@ def build_eval_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Whether to render the environment in real time during evaluation",
     )
-    p.add_argument("--num_workers", type=int, default=12, help="Number of workers")
+    p.add_argument(
+        "--temporal_agg",
+        action="store_true",
+        help="Whether to use temporal aggregation of actions for smoother execution",
+    )
     p.add_argument("--seed", type=int, default=319, help="Random seed")
     return p
 
