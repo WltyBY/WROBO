@@ -63,45 +63,22 @@ def copy_file_to_dstFolder(srcfile, dstfolder):
         print("Copy %s -> %s" % (srcfile, dst_path))
 
 
-def check_workers_alive_and_busy(
-    export_pool: Pool,
-    worker_list: List,
-    results_list: List,
-    allowed_num_queued: int = 0,
-):
-    """
+# def check_workers_alive_and_busy(
+#     export_pool: Pool,
+#     worker_list: List,
+#     results_list: List,
+#     allowed_num_queued: int = 0,
+# ):
+#     """
 
-    returns True if the number of results that are not ready is greater than the number of available workers + allowed_num_queued
-    """
-    alive = [i.is_alive() for i in worker_list]
-    if not all(alive):
-        raise RuntimeError("Some background workers are no longer alive")
+#     returns True if the number of results that are not ready is greater than the number of available workers + allowed_num_queued
+#     """
+#     alive = [i.is_alive() for i in worker_list]
+#     if not all(alive):
+#         raise RuntimeError("Some background workers are no longer alive")
 
-    not_ready = [not i.ready() for i in results_list]
-    if sum(not_ready) >= (len(export_pool._pool) + allowed_num_queued):
-        return True
-    return False
+#     not_ready = [not i.ready() for i in results_list]
+#     if sum(not_ready) >= (len(export_pool._pool) + allowed_num_queued):
+#         return True
+#     return False
 
-
-def print_h5_structure(filename):
-    def _print(name, obj, indent=""):
-        if isinstance(obj, h5py.Group):
-            print(f"{indent}├── [Group] {name}")
-            for key, val in obj.items():
-                _print(key, val, indent + "│   ")
-        elif isinstance(obj, h5py.Dataset):
-            print(
-                f"{indent}├── [Dataset] {name} (shape: {obj.shape}, dtype: {obj.dtype})"
-            )
-
-    with h5py.File(filename, "r") as f:
-        print(f"📁 HDF5 file: {filename}")
-        if f.attrs:
-            str_attrs = str(dict(f.attrs))
-            if len(str_attrs) > 150:
-                str_attrs = str_attrs[:150] + " ... (truncated)"
-        else:
-            str_attrs = "No attributes"
-        print(f"├── [Attr]: {str_attrs}")
-        for key, val in f.items():
-            _print(key, val, "")

@@ -10,20 +10,23 @@ import argparse
 import numpy as np
 import matplotlib.pyplot as plt
 
-from typing import Dict, Any, Tuple, List, Optional
+from typing import Dict
 from torchvision import transforms
 from time import time, sleep
 from datetime import datetime
+from collections import deque
+from torch import autocast
 
 from wrobo.envs.Aloha.utils.constants import DT
 from wrobo.envs.Aloha.utils.sim_envs import make_sim_env, BOX_POSE
 from wrobo.utils.file_operations import open_yaml, open_json
 from wrobo.methods.ACT.ACTTrainer import ACTTrainer
 from wrobo.utils.load_model_weights import load_pretrained_weights
+from wrobo.utils.others import dummy_context
 
 
 class AlohaEvaluator:
-    def __init__(self, eval_args: Dict[str, Any], verbose: bool = True):
+    def __init__(self, eval_args):
         """
         Args:
             eval_args:
@@ -31,13 +34,16 @@ class AlohaEvaluator:
                 - ckpt_name: filename of checkpoint to evaluate, e.g. "checkpoint_best.pth"
                 - seed: random seed for evaluation
         """
-        self.verbose = verbose
-
         self.get_eval_args(eval_args)
         self.init_random()
         self.get_norm_stats()
         self.device = self.get_device()
         self.img_transform = self.get_img_transform()
+
+        if torch.cuda.is_bf16_supported():
+            self.amp_dtype = torch.bfloat16
+        else:
+            self.amp_dtype = torch.float16
 
         self.eval_log_dir = os.path.join(
             self.log_dir,
@@ -121,6 +127,7 @@ class AlohaEvaluator:
     def _load_model(self) -> None:
         self.policy = ACTTrainer.get_policy(self.policy_config)
         self.state_dim = self.policy.config["proprio_dim"]
+        self.history_width = self.policy.config["history_width"]
         load_pretrained_weights(self.policy, os.path.join(self.log_dir, self.ckpt_name))
 
         self.policy.to(self.device)
@@ -157,10 +164,20 @@ class AlohaEvaluator:
                 images = []
                 for cam_name in cam_names:
                     image = image_dict[cam_name]
-                    image = image[:, :, [2, 1, 0]]  # swap B and R channel
+                    image = image[:, :, [2, 1, 0]]  # RGB -> BGR
                     images.append(image)
-                images = np.concatenate(images, axis=1)
-                out.write(images)
+
+                max_h = max(img.shape[0] for img in images)
+                images_resized = []
+                for img in images:
+                    h = img.shape[0]
+                    if h != max_h:
+                        scale = max_h / h
+                        img = cv2.resize(img, (int(img.shape[1] * scale), max_h))
+                    images_resized.append(img)
+
+                frame = np.concatenate(images_resized, axis=1)
+                out.write(frame)
             out.release()
             print(f"Saved video to: {video_path}")
         elif isinstance(video, dict):
@@ -197,9 +214,13 @@ class AlohaEvaluator:
         highest_rewards = []
 
         for rollout_id in range(self.num_rollouts):
-            BOX_POSE[0] = self.env._task.randomize_target_objs()
+            rn_ = self.env._task.randomize_target_objs()
+            BOX_POSE[0] = np.concatenate(rn_) if isinstance(rn_, (list, tuple)) else rn_
 
             ts = self.env.reset()
+            proprio_states_buffer = deque(maxlen=self.history_width)
+            num_cam = len(self.img_keys)
+            img_buffers = [deque(maxlen=self.history_width) for _ in range(num_cam)]
 
             if self.onscreen_render:
                 plt.ion()
@@ -237,34 +258,56 @@ class AlohaEvaluator:
                 all_available_img_keys = [i for i in obs.keys() if "image" in i]
                 image_list.append({k: obs[k] for k in all_available_img_keys})
 
-                # Prepare tensor inputs for policy
+                # Prepare single frame proprioceptive state in (1, 1, state_dim)
                 proprio_state_np = np.array(obs["proprio_state"])
                 # (1, state_dim)
                 proprio_state_norm = self._pre_process(
                     proprio_state_np, "proprio_state"
                 )[None]
-                proprio_state_tensor = (
-                    torch.from_numpy(proprio_state_norm).float().to(self.device)[None]
-                )  # (1, 1, state_dim) -> (bs, his_width, state_dim)
-
-                # prepare image tensor for policy
-                curr_images = []
-                for cam_name in self.img_keys:
-                    curr_image = ts.observation[cam_name]
-                    curr_image = self.img_transform(curr_image)  # (C, H, W)
-                    curr_images.append(
-                        curr_image[None]
-                    )  # (1, C, H, W) -> (his_width, C, H, W)
-                # (num_cams, 1, C, H, W) -> (num_cams, his_width, C, H, W)
-                curr_image = torch.stack(curr_images, axis=0)
-                curr_image = curr_image.to(self.device)[
+                proprio_state_tensor = torch.from_numpy(proprio_state_norm).float()[
                     None
-                ]  # (bs, num_cams, his_width, C, H, W)
+                ]  # (1, 1, state_dim) as (bs, his_width, state_dim)
+                if len(proprio_states_buffer) == 0:
+                    for _ in range(self.history_width):
+                        proprio_states_buffer.append(proprio_state_tensor.clone())
+                else:
+                    proprio_states_buffer.append(proprio_state_tensor)
+
+                # prepare single frame image in (1, num_cams, 1, C, H, W)
+                for i, cam_name in enumerate(self.img_keys):
+                    curr_image = ts.observation[cam_name]  # numpy (H_i, W_i, C)
+                    curr_image = self.img_transform(curr_image)  # torch (C, H_i, W_i)
+                    curr_image = curr_image[
+                        None, None
+                    ]  # (1, 1, C, H_i, W_i)  batch=1, history=1
+
+                    if len(img_buffers[i]) == 0:
+                        for _ in range(self.history_width):
+                            img_buffers[i].append(curr_image.clone())
+                    else:
+                        img_buffers[i].append(curr_image)
+
+                # prepare model input by concatenating history
+                propri_state_input = torch.cat(list(proprio_states_buffer), dim=1).to(
+                    self.device
+                )  # (1, history_width, state_dim)
+                img_input = []
+                for i in range(num_cam):
+                    # cat all history frames in the queue along the history dimension  → (1, history_width, C_i, H_i, W_i)
+                    cam_history = torch.cat(list(img_buffers[i]), dim=1).to(self.device)
+                    img_input.append(cam_history)
 
                 if t % query_frequency == 0:
-                    all_actions = self.policy(curr_image, proprio_state_tensor)[
-                        "pred"
-                    ]  # (1, action_chunk_size, action_dim)
+                    with (
+                        autocast(self.device.type, dtype=self.amp_dtype, enabled=True)
+                        if self.device.type == "cuda"
+                        else dummy_context()
+                    ):
+                        all_actions = self.policy(
+                            image=img_input, proprio_state=propri_state_input
+                        )["pred"]
+                        # (1, action_chunk_size, action_dim)
+                    all_actions = all_actions.float()
 
                 if self.temporal_agg:
                     all_time_actions[[t], t : t + num_queries] = all_actions
@@ -322,8 +365,11 @@ class AlohaEvaluator:
         success_rate = np.mean(np.array(highest_rewards) == self.env_max_reward)
         avg_return = np.mean(episode_returns)
 
-        self.print_to_log_file(f"\nSuccess rate: {success_rate:.2%}")
-        self.print_to_log_file(f"Average return: {avg_return:.2f}\n")
+        self.print_to_log_file("")
+        self.print_to_log_file(f"Success rate: {success_rate:.2%}")
+        self.print_to_log_file(f"Average return: {avg_return:.2f}")
+        self.print_to_log_file("")
+
         reward_distribution = {}
         for r in range(self.env_max_reward + 1):
             count = sum(hr >= r for hr in highest_rewards)
@@ -400,7 +446,7 @@ def build_eval_parser() -> argparse.ArgumentParser:
         "--ckpt_name",
         type=str,
         default="checkpoint_best.pth",
-        help="Name of checkpoint to evaluate",
+        help="Name of checkpoint (final or best) to evaluate",
     )
     p.add_argument(
         "--max_timesteps",

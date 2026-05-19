@@ -15,4 +15,10 @@ class BaseCollater:
                 collated[key] = torch.stack(values)
             else:
                 collated[key] = values
+        
+        img_lst = []
+        num_cam = len(batch[0]["image"])
+        for i in range(num_cam):
+             img_lst.append(torch.stack([b["image"][i] for b in batch], dim=0))
+        collated["image"] = img_lst
         return collated

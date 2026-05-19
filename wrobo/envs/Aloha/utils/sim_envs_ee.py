@@ -48,6 +48,18 @@ def make_ee_sim_env(task_name, random_seed=319):
             n_sub_steps=None,
             flat_observation=False,
         )
+    elif "sim_insertion" in task_name:
+        xml_path = os.path.join(XML_DIR, f"bimanual_viperx_ee_insertion.xml")
+        physics = mujoco.Physics.from_xml_path(xml_path)
+        task = InsertionEETask(random_seed=random_seed)
+        env = control.Environment(
+            physics,
+            task,
+            time_limit=20,
+            control_timestep=DT,
+            n_sub_steps=None,
+            flat_observation=False,
+        )
     else:
         raise NotImplementedError
     return env
@@ -152,6 +164,8 @@ class BimanualViperXEETask(base.Task):
         obs["image_front_close"] = physics.render(
             height=480, width=640, camera_id="front_close"
         )
+        obs["image_left_wrist"]  = physics.render(height=240, width=320, camera_id="left_wrist")
+        obs["image_right_wrist"] = physics.render(height=240, width=320, camera_id="right_wrist")
 
         # used in scripted policy to obtain starting pose
         obs["mocap_pose_left"] = np.concatenate(
@@ -232,3 +246,116 @@ class TransferCubeEETask(BimanualViperXEETask):
 
         cube_quat = np.array([1, 0, 0, 0])  # no rotation, (qw, qx, qy, qz)
         return np.concatenate([cube_position, cube_quat])
+
+
+class InsertionEETask(BimanualViperXEETask):
+    def __init__(self, random_seed=None):
+        super().__init__(random_seed=random_seed)
+        self.max_reward = 4
+
+    def initialize_episode(self, physics):
+        """Sets the state of the environment at the start of each episode."""
+        self.initialize_robots(physics)
+        # randomize peg and socket position
+        peg_pose, socket_pose = self.randomize_target_objs()
+        id2index = (
+            lambda j_id: 16 + (j_id - 16) * 7
+        )  # first 16 is robot qpos, 7 is pose dim # hacky
+
+        peg_start_id = physics.model.name2id("red_peg_joint", "joint")
+        peg_start_idx = id2index(peg_start_id)
+        np.copyto(physics.data.qpos[peg_start_idx : peg_start_idx + 7], peg_pose)
+        # print(f"randomized cube position to {cube_position}")
+
+        socket_start_id = physics.model.name2id("blue_socket_joint", "joint")
+        socket_start_idx = id2index(socket_start_id)
+        np.copyto(
+            physics.data.qpos[socket_start_idx : socket_start_idx + 7], socket_pose
+        )
+        # print(f"randomized cube position to {cube_position}")
+
+        super().initialize_episode(physics)
+
+    @staticmethod
+    def get_env_state(physics):
+        env_state = physics.data.qpos.copy()[16:]
+        return env_state
+
+    def get_reward(self, physics):
+        # return whether peg touches the pin
+        all_contact_pairs = []
+        for i_contact in range(physics.data.ncon):
+            id_geom_1 = physics.data.contact[i_contact].geom1
+            id_geom_2 = physics.data.contact[i_contact].geom2
+            name_geom_1 = physics.model.id2name(id_geom_1, "geom")
+            name_geom_2 = physics.model.id2name(id_geom_2, "geom")
+            contact_pair = (name_geom_1, name_geom_2)
+            all_contact_pairs.append(contact_pair)
+
+        touch_right_gripper = (
+            "red_peg",
+            "vx300s_right/10_right_gripper_finger",
+        ) in all_contact_pairs
+        touch_left_gripper = (
+            ("socket-1", "vx300s_left/10_left_gripper_finger") in all_contact_pairs
+            or ("socket-2", "vx300s_left/10_left_gripper_finger") in all_contact_pairs
+            or ("socket-3", "vx300s_left/10_left_gripper_finger") in all_contact_pairs
+            or ("socket-4", "vx300s_left/10_left_gripper_finger") in all_contact_pairs
+        )
+
+        peg_touch_table = ("red_peg", "table") in all_contact_pairs
+        socket_touch_table = (
+            ("socket-1", "table") in all_contact_pairs
+            or ("socket-2", "table") in all_contact_pairs
+            or ("socket-3", "table") in all_contact_pairs
+            or ("socket-4", "table") in all_contact_pairs
+        )
+        peg_touch_socket = (
+            ("red_peg", "socket-1") in all_contact_pairs
+            or ("red_peg", "socket-2") in all_contact_pairs
+            or ("red_peg", "socket-3") in all_contact_pairs
+            or ("red_peg", "socket-4") in all_contact_pairs
+        )
+        pin_touched = ("red_peg", "pin") in all_contact_pairs
+
+        reward = 0
+        if touch_left_gripper and touch_right_gripper:  # touch both
+            reward = 1
+        if (
+            touch_left_gripper
+            and touch_right_gripper
+            and (not peg_touch_table)
+            and (not socket_touch_table)
+        ):  # grasp both
+            reward = 2
+        if (
+            peg_touch_socket and (not peg_touch_table) and (not socket_touch_table)
+        ):  # peg and socket touching
+            reward = 3
+        if pin_touched:  # successful insertion
+            reward = 4
+        return reward
+
+    def randomize_target_objs(self):
+        x_range = [0.1, 0.2]
+        y_range = [0.4, 0.6]
+        z_range = [0.05, 0.05]
+
+        ranges = np.vstack([x_range, y_range, z_range])
+        peg_position = self._random.uniform(ranges[:, 0], ranges[:, 1])
+
+        peg_quat = np.array([1, 0, 0, 0])
+        peg_pose = np.concatenate([peg_position, peg_quat])
+
+        # Socket
+        x_range = [-0.2, -0.1]
+        y_range = [0.4, 0.6]
+        z_range = [0.05, 0.05]
+
+        ranges = np.vstack([x_range, y_range, z_range])
+        socket_position = self._random.uniform(ranges[:, 0], ranges[:, 1])
+
+        socket_quat = np.array([1, 0, 0, 0])
+        socket_pose = np.concatenate([socket_position, socket_quat])
+
+        return peg_pose, socket_pose

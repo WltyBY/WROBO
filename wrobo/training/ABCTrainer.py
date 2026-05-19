@@ -135,7 +135,12 @@ class DDPABCTrainer(ABC):
                 "Training logs will be saved in:", self.logs_output_folder
             )
 
-        self.grad_scaler = GradScaler() if self.device.type == "cuda" else None
+        if torch.cuda.is_bf16_supported():
+            self.amp_dtype = torch.bfloat16
+            self.grad_scaler = None   # BF16 don't need grad scaler
+        else:
+            self.amp_dtype = torch.float16
+            self.grad_scaler = GradScaler() if self.device.type == "cuda" else None
         self.logger = self.get_logger()
         self._best_ema = None
         self.ema_decay = getattr(self, "ema_decay", 0.9)

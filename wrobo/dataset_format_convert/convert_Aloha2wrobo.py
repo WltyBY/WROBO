@@ -3,12 +3,12 @@ import h5py
 
 import numpy as np
 
-from wrobo.utils.file_operations import print_h5_structure
+from wrobo.utils.vis import print_h5_structure
 
 
 def convert_hdf5_format(src_path, dst_path, comment, dataset_name="ACT", success=True):
-    with h5py.File(src_path, "r", rdcc_nbytes=1024**2 * 32) as src, h5py.File(
-        dst_path, "w", rdcc_nbytes=1024**2 * 32
+    with h5py.File(src_path, "r", rdcc_nbytes=1024**2 * 2) as src, h5py.File(
+        dst_path, "w", rdcc_nbytes=1024**2 * 2
     ) as dst:
         dst.attrs["dataset"] = dataset_name
         dst.attrs["success"] = success

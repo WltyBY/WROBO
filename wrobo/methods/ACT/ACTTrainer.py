@@ -101,8 +101,14 @@ class ACTTrainer(DDPABCTrainer):
             self.print_to_log_file(
                 "Training logs will be saved in:", self.logs_output_folder
             )
+        
+        if torch.cuda.is_bf16_supported():
+            self.amp_dtype = torch.bfloat16
+            self.grad_scaler = None   # BF16 don't need grad scaler
+        else:
+            self.amp_dtype = torch.float16
+            self.grad_scaler = GradScaler() if self.device.type == "cuda" else None
 
-        self.grad_scaler = GradScaler() if self.device.type == "cuda" else None
         self.logger = self.get_logger()
         self._best_ema = None
         self.ema_decay = getattr(self, "ema_decay", 0.9)
@@ -330,14 +336,17 @@ class ACTTrainer(DDPABCTrainer):
         is_pad = batch["is_pad"]
 
         # to device
-        images = images.to(self.device, non_blocking=True)
+        if isinstance(images, list):
+            images = [img.to(self.device, non_blocking=True) for img in images]
+        else:
+            images = images.to(self.device, non_blocking=True)
         proprio_states = proprio_states.to(self.device, non_blocking=True)
         actions = actions.to(self.device, non_blocking=True)
         is_pad = is_pad.to(self.device, non_blocking=True)
 
         self.optimizer.zero_grad(set_to_none=True)
         with (
-            autocast(self.device.type, enabled=True)
+            autocast(self.device.type, dtype=self.amp_dtype, enabled=True)
             if self.device.type == "cuda"
             else dummy_context()
         ):
@@ -389,13 +398,16 @@ class ACTTrainer(DDPABCTrainer):
         is_pad = batch["is_pad"]
 
         # to device
-        images = images.to(self.device, non_blocking=True)
+        if isinstance(images, list):
+            images = [img.to(self.device, non_blocking=True) for img in images]
+        else:
+            images = images.to(self.device, non_blocking=True)
         proprio_states = proprio_states.to(self.device, non_blocking=True)
         actions = actions.to(self.device, non_blocking=True)
         is_pad = is_pad.to(self.device, non_blocking=True)
 
         with (
-            autocast(self.device.type, enabled=True)
+            autocast(self.device.type, dtype=self.amp_dtype, enabled=True)
             if self.device.type == "cuda"
             else dummy_context()
         ):

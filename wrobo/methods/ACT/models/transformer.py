@@ -422,6 +422,8 @@ class DETRVAE(nn.Module):
 
         self.time_embed = nn.Embedding(max(history_width, 50), embed_dim)
         if history_width == 1:
+            # if history_width is 1, we don't need time embedding,
+            # so we freeze the time embedding and set it to zero.
             self.time_embed.weight.requires_grad_(False)
             with torch.no_grad():
                 self.time_embed.weight.zero_()
@@ -450,6 +452,7 @@ class DETRVAE(nn.Module):
             self.backbone = backbone
             self.backbone_PE = backbone_PE
             self.img_proj = nn.Conv2d(backbone.num_channels, embed_dim, kernel_size=1)
+            self.img_norm = nn.LayerNorm(embed_dim)
             self.decoder_proprio_proj = nn.Linear(self.proprio_dim, embed_dim)
         else:
             self.backbone = None
@@ -478,12 +481,21 @@ class DETRVAE(nn.Module):
 
     def forward(self, image, proprio_state, env_state, actions=None, is_pad=None):
         """
-        image: batch, num_cam, his_width, channel, height, width
+        image: list of tensors (len=num_cam), each [batch, history_width, C, H, W]
+            or (batch, num_cam, history_width, C, H, W) for backward compatibility
         proprio_state: batch, his_width, proprio_dim
-        env_state: None
+        env_state: None or batch, history_width, env_dim (if backbone is None)
         actions: batch, seq, action_dim
-        """
-        bs, num_cam, his_width, *_ = image.shape
+        """        
+        if isinstance(image, list):
+            num_cam = len(image)
+            bs, his_width, *_ = image[0].shape
+            image_list = image
+        else:
+            # if image in (batch, num_cam, history_width, C, H, W)
+            bs, num_cam, his_width, *_ = image.shape
+            image_list = [image[:, i] for i in range(num_cam)]
+
         ################# VAE Encoder forward #################
         # Prepare style variable z
         if actions is not None:  # Training
@@ -552,10 +564,12 @@ class DETRVAE(nn.Module):
             all_cam_pos = []
             for cam_id in range(num_cam):
                 # (bs, his_width, channel, height, width)
-                cam_imgs = image[:, cam_id]
+                cam_imgs = image_list[cam_id]
+                # (bs*his_width, channel, height, width)
                 cam_imgs = cam_imgs.flatten(
                     0, 1
-                )  # (bs*his_width, channel, height, width)
+                )
+
                 features = self.backbone(cam_imgs)[
                     "4"
                 ]  # take the last layer (layer_4) feature
@@ -591,10 +605,11 @@ class DETRVAE(nn.Module):
             # fold camera dimension into width dimension
             # all_cam_features: [(bs, his_width*H*W, embed_dim), ...] -> (bs, his_width, num_cam, embed_dim, H*W)
             cam_features = (
-                torch.stack(all_cam_features, axis=2).transpose(-1, -2).flatten(1, 3)
+                torch.cat(all_cam_features, axis=3).transpose(-1, -2).flatten(1, 2)
             )  # (bs, his_width*num_cam*H*W, embed_dim)
+            cam_features = self.img_norm(cam_features)
             cam_pos = (
-                torch.stack(all_cam_pos, axis=2).transpose(-1, -2).flatten(1, 3)
+                torch.cat(all_cam_pos, axis=3).transpose(-1, -2).flatten(1, 2)
             )  # (bs, his_width*num_cam*H*W, embed_dim)
 
             # (action_chunk_size, embed_dim) -> (bs, action_chunk_size, embed_dim)
@@ -624,10 +639,10 @@ class DETRVAE(nn.Module):
             pos = torch.cat([cam_pos, proprio_z_pos_embed], axis=1)
 
             hs = self.transformer(
-                x=input,
+                x=input.float(),
                 mask=None,
-                q_pos_embed=AC_pos_embed,
-                c_pos_embed=pos,
+                q_pos_embed=AC_pos_embed.float(),
+                c_pos_embed=pos.float(),
             )[0]
         else:
             env_state = self.env_proj(env_state)  # (bs, his_width, embed_dim)

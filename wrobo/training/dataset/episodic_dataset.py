@@ -163,11 +163,11 @@ class EpisodicDataset(Dataset):
                 if "is_pad" not in data_dict:
                     data_dict["is_pad"] = torch.from_numpy(is_pad).bool()
 
-        # stack a num_cameras dimension for image observations, to be compatible with the model input
+        # generate "image" key for easier access in the model, which is a list of image tensors with shape [history_width, C, H, W]
         if self.cam_keys:
-            image_lst = [data_dict[key] for key in self.cam_keys]
-            # [history_width, C, H, W] -> [num_cam, history_width, C, H, W]
-            data_dict["image"] = torch.stack(image_lst, dim=0)
+            data_dict["image"] = [data_dict[key] for key in self.cam_keys]
+            # we do not stack a new dimension for camera views, since different cameras may have different image sizes and channel numbers,
+            # and the model should be able to handle variable number of camera views. The model can access each camera view by data_dict["image"][i], which has shape [history_width, C, H, W].
             for key in self.cam_keys:
                 del data_dict[key]
         
