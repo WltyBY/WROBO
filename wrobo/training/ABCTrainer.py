@@ -194,9 +194,11 @@ class DDPABCTrainer(ABC):
                     output_device=self.device.index,
                 )
 
-            if self.is_main_process():
-                self.print_to_log_file("Compiling network...")
-            self.network = torch.compile(self.network)
+            if self.do_compile:
+                if self.is_main_process():
+                    self.print_to_log_file("Compiling network...")
+                self.network = torch.compile(self.network)
+                torch.compiler.reset()
 
             self.optimizer, self.lr_scheduler = self.get_optimizers()
 
@@ -416,6 +418,7 @@ class DDPABCTrainer(ABC):
         self.warmup_epoch = training_args.warmup_epoch
         self.batch_size = training_args.batch_size
         self.args_gpu = training_args.gpu
+        self.do_compile = training_args.do_compile
         self.continue_train = training_args.continue_train
         self.pretrained_weight = training_args.pretrained_weight
         self.num_workers = training_args.num_workers

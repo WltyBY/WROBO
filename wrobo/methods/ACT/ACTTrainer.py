@@ -160,9 +160,11 @@ class ACTTrainer(DDPABCTrainer):
                     output_device=self.device.index,
                 )
 
-            if self.is_main_process():
-                self.print_to_log_file("Compiling network...")
-            self.network = torch.compile(self.network)
+            if self.do_compile:
+                if self.is_main_process():
+                    self.print_to_log_file("Compiling network...")
+                self.network = torch.compile(self.network)
+                torch.compiler.reset()
 
             self.optimizer, self.lr_scheduler = self.get_optimizers()
 

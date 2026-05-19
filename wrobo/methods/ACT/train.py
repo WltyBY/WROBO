@@ -1,4 +1,3 @@
-import torch
 import argparse
 
 from wrobo.training.running.run_args import build_train_parser
@@ -14,5 +13,10 @@ args = parser.parse_args()
 
 
 if __name__ == "__main__":
+    # import torch
+    # torch.backends.cuda.enable_math_sdp(True)
+    # torch.backends.cuda.enable_flash_sdp(False)
+    # torch.backends.cuda.enable_mem_efficient_sdp(False)
+
     Trainer = ACTTrainer(training_args=args)
     Trainer.run_training()

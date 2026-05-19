@@ -134,6 +134,7 @@ class AlohaEvaluator:
 
         print("Compiling network...")
         self.policy = torch.compile(self.policy)
+        torch.compiler.reset()
 
         self.policy.eval()
 

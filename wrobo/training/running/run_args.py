@@ -71,6 +71,11 @@ def build_train_parser() -> argparse.ArgumentParser:
         help="CPU=-1; GPU ID=0; Multi-GPU=0,1,2...; All GPUs=all",
     )
     p.add_argument(
+        "--do_compile",
+        action="store_true",
+        help="Enable PyTorch 2.0 compile for training. Call this param to enable it.",
+    )
+    p.add_argument(
         "--continue_train",
         "--c",
         action="store_true",
