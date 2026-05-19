@@ -452,7 +452,6 @@ class DETRVAE(nn.Module):
             self.backbone = backbone
             self.backbone_PE = backbone_PE
             self.img_proj = nn.Conv2d(backbone.num_channels, embed_dim, kernel_size=1)
-            self.img_norm = nn.LayerNorm(embed_dim)
             self.decoder_proprio_proj = nn.Linear(self.proprio_dim, embed_dim)
         else:
             self.backbone = None
@@ -607,7 +606,6 @@ class DETRVAE(nn.Module):
             cam_features = (
                 torch.cat(all_cam_features, axis=3).transpose(-1, -2).flatten(1, 2)
             )  # (bs, his_width*num_cam*H*W, embed_dim)
-            cam_features = self.img_norm(cam_features)
             cam_pos = (
                 torch.cat(all_cam_pos, axis=3).transpose(-1, -2).flatten(1, 2)
             )  # (bs, his_width*num_cam*H*W, embed_dim)
@@ -639,10 +637,10 @@ class DETRVAE(nn.Module):
             pos = torch.cat([cam_pos, proprio_z_pos_embed], axis=1)
 
             hs = self.transformer(
-                x=input.float(),
+                x=input,
                 mask=None,
-                q_pos_embed=AC_pos_embed.float(),
-                c_pos_embed=pos.float(),
+                q_pos_embed=AC_pos_embed,
+                c_pos_embed=pos,
             )[0]
         else:
             env_state = self.env_proj(env_state)  # (bs, his_width, embed_dim)

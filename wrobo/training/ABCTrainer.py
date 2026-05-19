@@ -138,9 +138,14 @@ class DDPABCTrainer(ABC):
         if torch.cuda.is_bf16_supported():
             self.amp_dtype = torch.bfloat16
             self.grad_scaler = None   # BF16 don't need grad scaler
+            if self.is_main_process():
+                self.print_to_log_file("Using BF16 precision for training.")
         else:
             self.amp_dtype = torch.float16
             self.grad_scaler = GradScaler() if self.device.type == "cuda" else None
+            if self.is_main_process():
+                self.print_to_log_file("Using FP16 precision for training with GradScaler.")
+                
         self.logger = self.get_logger()
         self._best_ema = None
         self.ema_decay = getattr(self, "ema_decay", 0.9)
@@ -543,6 +548,13 @@ class DDPABCTrainer(ABC):
                 "Consider setting weight_decay to 0 for PReLU parameters.",
                 UserWarning,
             )
+
+    @staticmethod
+    def check_tensor(x, name):
+        if torch.isnan(x).any():
+            print(f"NaN in {name}, min={x.min()}, max={x.max()}")
+        if torch.isinf(x).any():
+            print(f"Inf in {name}, min={x.min()}, max={x.max()}")
 
     def save_checkpoint(self, filename: str) -> None:
         """

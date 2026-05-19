@@ -105,9 +105,13 @@ class ACTTrainer(DDPABCTrainer):
         if torch.cuda.is_bf16_supported():
             self.amp_dtype = torch.bfloat16
             self.grad_scaler = None   # BF16 don't need grad scaler
+            if self.is_main_process():
+                self.print_to_log_file("Using BF16 precision for training.")
         else:
             self.amp_dtype = torch.float16
             self.grad_scaler = GradScaler() if self.device.type == "cuda" else None
+            if self.is_main_process():
+                self.print_to_log_file("Using FP16 precision for training with GradScaler.")
 
         self.logger = self.get_logger()
         self._best_ema = None
@@ -376,14 +380,14 @@ class ACTTrainer(DDPABCTrainer):
         if self.grad_scaler is not None:
             self.grad_scaler.scale(l).backward()
             self.grad_scaler.unscale_(self.optimizer)
-            torch.nn.utils.clip_grad_norm_(self.network.parameters(), 12)
+            torch.nn.utils.clip_grad_norm_(self.network.parameters(), 1.0)
             self.grad_scaler.step(self.optimizer)
             self.grad_scaler.update()
         else:
             l.backward()
-            torch.nn.utils.clip_grad_norm_(self.network.parameters(), 12)
+            torch.nn.utils.clip_grad_norm_(self.network.parameters(), 1.0)
             self.optimizer.step()
-
+                    
         return {
             "loss": l.detach().cpu().numpy(),
             "L1_loss": l1_.detach().cpu().numpy(),
