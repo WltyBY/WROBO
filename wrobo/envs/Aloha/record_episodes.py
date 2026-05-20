@@ -64,7 +64,7 @@ class AlohaDataCollector:
 
         print(f"\nData saved to: {self.dataset_dir}")
         print(
-            f"Saved Success Rate: {np.sum(self.success)} / {len(self.saved_episodes)} "
+            f"Saved Success Rate: {np.sum(self.success)} / {self.saved_episodes} "
             f"(over {self.attempt} attempts)"
         )
 
