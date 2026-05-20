@@ -25,7 +25,7 @@ class ACTTrainer(DDPABCTrainer):
     ):
         self.verbose = verbose
 
-        self.save_every = 1
+        self.save_every = 5
         self.disable_checkpointing = False
 
         self.get_default_training_args(training_args)
