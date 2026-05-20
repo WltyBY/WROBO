@@ -25,8 +25,6 @@ class ACTTrainer(DDPABCTrainer):
     ):
         self.verbose = verbose
 
-        self.was_initialized = False
-        self.current_epoch = 0
         self.save_every = 1
         self.disable_checkpointing = False
 
@@ -119,6 +117,8 @@ class ACTTrainer(DDPABCTrainer):
         self.norm_stats = open_json(
             os.path.join(self.logs_output_folder, "norm_stats.json")
         )
+        self.was_initialized = False
+        self.current_epoch = 0
 
         if self.continue_train:
             checkpoint = os.path.join(self.logs_output_folder, "checkpoint_latest.pth")

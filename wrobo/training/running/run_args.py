@@ -73,7 +73,7 @@ def build_train_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--do_compile",
         action="store_true",
-        help="Enable PyTorch 2.0 compile for training. Call this param to enable it.",
+        help="Enable compile for training.",
     )
     p.add_argument(
         "--continue_train",
@@ -86,7 +86,7 @@ def build_train_parser() -> argparse.ArgumentParser:
         type=str,
         help="Continue training from a specific checkpoint folder.",
     )
-    p.add_argument("--num_workers", type=int, default=12, help="Number of workers")
+    p.add_argument("--num_workers", type=int, default=16, help="Number of workers")
     p.add_argument("--seed", type=int, default=319, help="Random seed")
     p.add_argument(
         "--no_deterministic",

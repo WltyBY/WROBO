@@ -213,6 +213,7 @@ class AlohaEvaluator:
 
         episode_returns = []
         highest_rewards = []
+        model_infer_time = []
 
         for rollout_id in range(self.num_rollouts):
             rn_ = self.env._task.randomize_target_objs()
@@ -299,6 +300,7 @@ class AlohaEvaluator:
                     img_input.append(cam_history)
 
                 if t % query_frequency == 0:
+                    infer_start = time()
                     with (
                         autocast(self.device.type, dtype=self.amp_dtype, enabled=True)
                         if self.device.type == "cuda"
@@ -308,6 +310,8 @@ class AlohaEvaluator:
                             image=img_input, proprio_state=propri_state_input
                         )["pred"]
                         # (1, action_chunk_size, action_dim)
+                    infer_duration = time() - infer_start
+                    model_infer_time.append(infer_duration)
                     all_actions = all_actions.float()
 
                 if self.temporal_agg:
@@ -366,9 +370,17 @@ class AlohaEvaluator:
         success_rate = np.mean(np.array(highest_rewards) == self.env_max_reward)
         avg_return = np.mean(episode_returns)
 
+        avg_infer_time_sec = np.mean(model_infer_time)
+        avg_infer_time_ms = avg_infer_time_sec * 1000.0
+        infer_fps = 1.0 / avg_infer_time_sec
+        gpu_name = torch.cuda.get_device_name(self.device) if self.device.type == 'cuda' else "CPU"
+        
         self.print_to_log_file("")
         self.print_to_log_file(f"Success rate: {success_rate:.2%}")
         self.print_to_log_file(f"Average return: {avg_return:.2f}")
+        self.print_to_log_file(f"Average Model inference time: {avg_infer_time_ms:.2f} ms")
+        self.print_to_log_file(f"Inference FPS: {infer_fps:.2f} Hz")
+        self.print_to_log_file(f"Device: {gpu_name}")
         self.print_to_log_file("")
 
         reward_distribution = {}
