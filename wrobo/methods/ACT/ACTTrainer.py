@@ -1,5 +1,6 @@
 import os
 import torch
+import warnings
 
 from datetime import datetime
 from torch import GradScaler, optim, nn, autocast
@@ -163,6 +164,12 @@ class ACTTrainer(DDPABCTrainer):
             if self.do_compile:
                 if self.is_main_process():
                     self.print_to_log_file("Compiling network...")
+                    warnings.warn(
+                        "⚠️ Find you use --do_compile during training, which can significantly speed up the training."
+                        "However, I found NaN during training while debugging with torch.compile, which may be due to some unstable operators in the model. "
+                        "If you also encounter NaN during training, consider don't use --do_compile to False or try to find out which operator causes the instability and avoid using it. ",
+                        RuntimeWarning,
+                    )
                 self.network = torch.compile(self.network)
                 torch.compiler.reset()
 
