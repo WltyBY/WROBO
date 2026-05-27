@@ -1,4 +1,5 @@
 h5py
+pyyaml
 opencv-python
 numpy
 tqdm

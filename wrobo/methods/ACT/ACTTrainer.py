@@ -32,7 +32,7 @@ class ACTTrainer(DDPABCTrainer):
         self.get_default_training_args(training_args)
         self.get_custom_training_args(training_args)
 
-        self.device = self.get_device()
+        self.get_device()
 
         # Task-general params
         task_general_names = "BS_{}_GPU_NUM_{}_EPOCH_{}_SEED_{}_PRETRAINED_{}".format(
@@ -159,6 +159,7 @@ class ACTTrainer(DDPABCTrainer):
                     self.network,
                     device_ids=[self.device.index],
                     output_device=self.device.index,
+                    find_unused_parameters=True,
                 )
 
             if self.do_compile:

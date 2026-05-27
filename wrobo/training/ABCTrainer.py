@@ -63,7 +63,7 @@ class DDPABCTrainer(ABC):
         self.get_default_training_args(training_args)
         self.get_custom_training_args(training_args)
 
-        self.device = self.get_device()
+        self.get_device()
 
         # Task-general params
         task_general_names = "BS_{}_GPU_NUM_{}_EPOCH_{}_SEED_{}_PRETRAINED_{}".format(
@@ -460,8 +460,8 @@ class DDPABCTrainer(ABC):
 
         if ddp:
             local_rank = int(os.environ["LOCAL_RANK"])
-            device = torch.device(f"cuda:{local_rank}")
-            torch.cuda.set_device(device)
+            self.device = torch.device(f"cuda:{local_rank}")
+            torch.cuda.set_device(self.device)
 
             if not dist.is_initialized():
                 dist.init_process_group(backend="nccl", init_method="env://")
@@ -471,12 +471,10 @@ class DDPABCTrainer(ABC):
         else:
             self.rank = 0
             self.world_size = 1
-            device = torch.device("cuda:0" if use_cuda else "cpu")
+            self.device = torch.device("cuda:0" if use_cuda else "cpu")
 
         self.is_ddp = ddp
         self.sync_processes()
-
-        return device
 
     def _build_deep_supervision_loss_object(self, loss, num_deep_supervision_scales):
         # we give each output a weight which decreases exponentially (division by 2) as the resolution decreases
@@ -815,7 +813,7 @@ class DDPABCTrainer(ABC):
             self.logger.log("Epoch_time", epoch_time, epoch)
 
             # handling periodic checkpointing
-            if (epoch + 1) % self.save_every == 0 and epoch != (self.num_epoch - 1):
+            if epoch % self.save_every == 0 and epoch != (self.num_epoch - 1):
                 self.save_checkpoint(
                     os.path.join(self.logs_output_folder, "checkpoint_latest.pth")
                 )
