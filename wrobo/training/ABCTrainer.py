@@ -64,6 +64,7 @@ class DDPABCTrainer(ABC):
         self.get_custom_training_args(training_args)
 
         self.device = self.get_device()
+        self.sync_processes()
 
         # Task-general params
         task_general_names = "BS_{}_EPOCH_{}_SEED_{}_PRETRAINED_{}".format(
