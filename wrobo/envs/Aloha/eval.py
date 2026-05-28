@@ -47,7 +47,7 @@ class AlohaEvaluator:
 
         self.eval_log_dir = os.path.join(
             self.log_dir,
-            f"evaluation_{self.ckpt_name.replace('.pth', '')}_temporal_agg_{self.temporal_agg}",
+            f"eval_{self.ckpt_name.replace('.pth', '')}_max_timestep_{self.max_timesteps}_temporal_agg_{self.temporal_agg}",
         )
         os.makedirs(self.eval_log_dir, exist_ok=True)
         self.log_file = os.path.join(self.eval_log_dir, "log.txt")

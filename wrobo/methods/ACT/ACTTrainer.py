@@ -32,12 +32,11 @@ class ACTTrainer(DDPABCTrainer):
         self.get_default_training_args(training_args)
         self.get_custom_training_args(training_args)
 
-        self.get_device()
+        self.device = self.get_device()
 
         # Task-general params
-        task_general_names = "BS_{}_GPU_NUM_{}_EPOCH_{}_SEED_{}_PRETRAINED_{}".format(
+        task_general_names = "BS_{}_EPOCH_{}_SEED_{}_PRETRAINED_{}".format(
             self.batch_size,
-            self.world_size,
             self.num_epoch,
             self.random_seed,
             self.pretrained_weight is not None,
@@ -63,16 +62,14 @@ class ACTTrainer(DDPABCTrainer):
             hyperparams_name,
             "fold_" + self.fold,
         )
-        if not os.path.exists(self.logs_output_folder):
+
+        if self.is_main_process():
             os.makedirs(self.logs_output_folder, exist_ok=True)
-
-        self.log_file = os.path.join(self.logs_output_folder, time_ + ".txt")
-        with open(self.log_file, "w"):
-            pass
-
-        self.print_to_log_file(
-            f"Using device: {self.device} | DDP: {self.is_ddp} | rank {self.rank}/{self.world_size}"
-        )
+            self.log_file = os.path.join(self.logs_output_folder, time_ + ".txt")
+            with open(self.log_file, "w"):
+                pass
+        else:
+            self.log_file = None
 
         config_and_code_save_path = os.path.join(
             self.logs_output_folder, "Config_and_Trainer"
@@ -84,6 +81,10 @@ class ACTTrainer(DDPABCTrainer):
 
         if self.is_main_process():
             os.makedirs(config_and_code_save_path, exist_ok=True)
+
+            self.print_to_log_file(
+                f"Using device: {self.device.type} | DDP: {self.is_ddp} | world_size: {self.world_size}"
+            )
 
             # copy the config file to the logs folder
             copy_file_to_dstFolder(self.config_file, config_and_code_save_path)
@@ -100,17 +101,19 @@ class ACTTrainer(DDPABCTrainer):
             self.print_to_log_file(
                 "Training logs will be saved in:", self.logs_output_folder
             )
-        
+
         if torch.cuda.is_bf16_supported():
             self.amp_dtype = torch.bfloat16
-            self.grad_scaler = None   # BF16 don't need grad scaler
+            self.grad_scaler = None  # BF16 don't need grad scaler
             if self.is_main_process():
                 self.print_to_log_file("Using BF16 precision for training.")
         else:
             self.amp_dtype = torch.float16
             self.grad_scaler = GradScaler() if self.device.type == "cuda" else None
             if self.is_main_process():
-                self.print_to_log_file("Using FP16 precision for training with GradScaler.")
+                self.print_to_log_file(
+                    "Using FP16 precision for training with GradScaler."
+                )
 
         self.logger = self.get_logger()
         self._best_ema = None
@@ -159,7 +162,7 @@ class ACTTrainer(DDPABCTrainer):
                     self.network,
                     device_ids=[self.device.index],
                     output_device=self.device.index,
-                    find_unused_parameters=True,
+                    find_unused_parameters=not self.do_compile,
                 )
 
             if self.do_compile:
@@ -168,7 +171,7 @@ class ACTTrainer(DDPABCTrainer):
                     warnings.warn(
                         "⚠️ Find you use --do_compile during training, which can significantly speed up the training."
                         "However, I found NaN during training while debugging with torch.compile, which may be due to some unstable operators in the model. "
-                        "If you also encounter NaN during training, consider don't use --do_compile to False or try to find out which operator causes the instability and avoid using it. ",
+                        "If you also encounter NaN during training, consider don't use --do_compile or try to find out which operator causes the instability and avoid using it. ",
                         RuntimeWarning,
                     )
                 self.network = torch.compile(self.network)
@@ -313,10 +316,14 @@ class ACTTrainer(DDPABCTrainer):
         val_sampler = self.build_sampler(val_dataset)
 
         this_num_workers = max(1, self.num_workers // self.world_size)
+        assert (
+            self.batch_size % self.world_size == 0
+        ), f"Batch size {self.batch_size} should be divisible by world size {self.world_size} for distributed training."
+        this_batch_size = self.batch_size // self.world_size
 
         train_loader = DataLoader(
             train_dataset,
-            batch_size=self.batch_size,
+            batch_size=this_batch_size,
             sampler=train_sampler,
             shuffle=False,
             num_workers=this_num_workers,
@@ -325,20 +332,20 @@ class ACTTrainer(DDPABCTrainer):
             persistent_workers=True,
             worker_init_fn=self.worker_init_fn,
             drop_last=True,
-            prefetch_factor=max(1, 3 - (self.batch_size // 64)),
+            prefetch_factor=2,
         )
 
         val_loader = DataLoader(
             val_dataset,
-            batch_size=self.batch_size,
+            batch_size=this_batch_size,
             sampler=val_sampler,
             shuffle=False,
-            num_workers=max(1, this_num_workers // 2),
+            num_workers=this_num_workers,
             collate_fn=BaseCollater(),
             pin_memory=self.device.type == "cuda",
             persistent_workers=True,
             drop_last=True,
-            prefetch_factor=max(1, 2 - (self.batch_size // 64)),
+            prefetch_factor=2,
         )
 
         return train_loader, val_loader
@@ -397,7 +404,7 @@ class ACTTrainer(DDPABCTrainer):
             l.backward()
             torch.nn.utils.clip_grad_norm_(self.network.parameters(), 1.0)
             self.optimizer.step()
-                    
+
         return {
             "loss": l.detach().cpu().numpy(),
             "L1_loss": l1_.detach().cpu().numpy(),
