@@ -59,7 +59,7 @@ class EpisodicDataset(Dataset):
         self.episode_ids = self._get_episode_ids()
         self._h5_cache = OrderedDict()
         self._h5_cache_size = min(len(self), 256)
-        self._h5_rdcc_nbytes = 1024**2 * 32  # 32MB cache for each file
+        self._h5_rdcc_nbytes = 1024**2 * 16  # 16MB cache for each file
 
     def __len__(self):
         return len(self.episode_ids)
