@@ -36,7 +36,19 @@ def make_ee_sim_env(task_name, random_seed=319):
                                         right_gripper_qvel (1)]     # normalized gripper velocity (pos: opening, neg: closing)
                         "images": {"main": (480x640x3)}        # h, w, c, dtype='uint8'
     """
-    if "sim_transfer_cube" in task_name:
+    if "sim_transfer_cube_stack" in task_name:
+        xml_path = os.path.join(XML_DIR, "bimanual_viperx_ee_transfer_cube_stack.xml")
+        physics = mujoco.Physics.from_xml_path(xml_path)
+        task = TransferCubeStackEETask(random_seed=random_seed)
+        env = control.Environment(
+            physics,
+            task,
+            time_limit=50,  # longer time limit for stacking
+            control_timestep=DT,
+            n_sub_steps=None,
+            flat_observation=False,
+        )
+    elif "sim_transfer_cube" in task_name:
         xml_path = os.path.join(XML_DIR, f"bimanual_viperx_ee_transfer_cube.xml")
         physics = mujoco.Physics.from_xml_path(xml_path)
         task = TransferCubeEETask(random_seed=random_seed)
@@ -164,8 +176,12 @@ class BimanualViperXEETask(base.Task):
         obs["image_front_close"] = physics.render(
             height=480, width=640, camera_id="front_close"
         )
-        obs["image_left_wrist"]  = physics.render(height=240, width=320, camera_id="left_wrist")
-        obs["image_right_wrist"] = physics.render(height=240, width=320, camera_id="right_wrist")
+        obs["image_left_wrist"] = physics.render(
+            height=240, width=320, camera_id="left_wrist"
+        )
+        obs["image_right_wrist"] = physics.render(
+            height=240, width=320, camera_id="right_wrist"
+        )
 
         # used in scripted policy to obtain starting pose
         obs["mocap_pose_left"] = np.concatenate(
@@ -187,6 +203,7 @@ class TransferCubeEETask(BimanualViperXEETask):
     def __init__(self, random_seed=None):
         super().__init__(random_seed=random_seed)
         self.max_reward = 4
+        self.episode_len = 400
 
     def initialize_episode(self, physics):
         """Sets the state of the environment at the start of each episode."""
@@ -252,6 +269,7 @@ class InsertionEETask(BimanualViperXEETask):
     def __init__(self, random_seed=None):
         super().__init__(random_seed=random_seed)
         self.max_reward = 4
+        self.episode_len = 400
 
     def initialize_episode(self, physics):
         """Sets the state of the environment at the start of each episode."""
@@ -359,3 +377,157 @@ class InsertionEETask(BimanualViperXEETask):
         socket_pose = np.concatenate([socket_position, socket_quat])
 
         return peg_pose, socket_pose
+
+
+class TransferCubeStackEETask(BimanualViperXEETask):
+    """
+    The task is to pass and stack three colored blocks in order.
+    - Initially, three differently colored blocks are located in the right gripper area (random positions)
+    - They must be passed in order (red -> green -> blue) from the right arm to the left arm
+    - Each time the left arm catches a block, it is stacked on top of the previous block
+    """
+
+    def __init__(self, random_seed=None):
+        super().__init__(random_seed=random_seed)
+        self.max_reward = 9
+        self.episode_len = 2400
+        self.color_order = ["red", "green", "blue"]
+        self.current_color_idx = 0
+        self.stacked_count = 0
+        self.stack_target_positions = None  # compute in initialize_episode
+
+    def initialize_episode(self, physics):
+        """Sets the state of the environment at the start of each episode."""
+        self.initialize_robots(physics)
+
+        # Generate random poses for the three blocks
+        all_poses = self.randomize_target_objs()
+
+        # Set poses for each block using joint_qposadr
+        joint_names = ["red_box_joint", "green_box_joint", "blue_box_joint"]
+        for i, jname in enumerate(joint_names):
+            joint_id = physics.model.name2id(jname, "joint")
+            start_idx = physics.model.jnt_qposadr[joint_id]
+            pose = all_poses[i * 7 : (i + 1) * 7]
+            np.copyto(physics.data.qpos[start_idx : start_idx + 7], pose)
+
+        # Reset task state
+        self.current_color_idx = 0
+        self.stacked_count = 0
+        # Stacking target positions (left arm side table)
+        base_stack = np.array([-0.10, 0.5, 0.02])
+        self.stack_target_positions = [
+            base_stack,
+            base_stack + np.array([0, 0, 0.04]),
+            base_stack + np.array([0, 0, 0.08]),
+        ]
+
+        super().initialize_episode(physics)
+
+    @staticmethod
+    def get_env_state(physics):
+        # Return current poses of all three blocks (21 dim)
+        # We need to extract them in order: red, green, blue
+        joint_names = ["red_box_joint", "green_box_joint", "blue_box_joint"]
+        poses = []
+        for jname in joint_names:
+            joint_id = physics.model.name2id(jname, "joint")
+            start_idx = physics.model.jnt_qposadr[joint_id]
+            poses.append(physics.data.qpos[start_idx : start_idx + 7].copy())
+        return np.concatenate(poses)
+
+    def get_reward(self, physics):
+        if self.current_color_idx >= 3:
+            return self.max_reward
+
+        target_color = self.color_order[self.current_color_idx]
+        target_geom = f"{target_color}_box"
+
+        # compute contacts
+        all_contacts = []
+        for i in range(physics.data.ncon):
+            g1 = physics.model.id2name(physics.data.contact[i].geom1, "geom")
+            g2 = physics.model.id2name(physics.data.contact[i].geom2, "geom")
+            all_contacts.append((g1, g2))
+
+        def touching(box, part):
+            return (box, part) in all_contacts or (part, box) in all_contacts
+
+        touch_right_gripper = touching(
+            target_geom, "vx300s_right/10_right_gripper_finger"
+        )
+        touch_left_gripper = touching(target_geom, "vx300s_left/10_left_gripper_finger")
+        touch_table = touching(target_geom, "table")
+
+        # get current block position
+        joint_id = physics.model.name2id(f"{target_color}_box_joint", "joint")
+        start_idx = physics.model.jnt_qposadr[joint_id]
+        box_pos = physics.data.qpos[start_idx : start_idx + 3]
+        target_pos = self.stack_target_positions[self.stacked_count]
+        dist_to_target = np.linalg.norm(box_pos - target_pos)
+
+        # Check if block is successfully stacked (reached target and not held)
+        if (
+            dist_to_target < 0.015
+            and not touch_right_gripper
+            and not touch_left_gripper
+        ):
+            self.stacked_count += 1
+            self.current_color_idx += 1
+            return self.stacked_count * 3
+
+        progress = 0
+        if touch_right_gripper and not touch_table:
+            progress = 1  # grasped by right arm
+        if touch_left_gripper and not touch_right_gripper and not touch_table:
+            progress = 2  # passed to left arm
+
+        return self.stacked_count * 3 + progress
+
+    def randomize_target_objs(self):
+        """
+        Generate random initial poses for three blocks (right arm workspace, non-overlapping).
+        Support two arrangement modes: horizontal (divide X into three segments) or vertical (divide Y into three segments), randomly chosen.
+        """
+        # right arm workspace (adjusted based on actual robot range and original transfer_cube task)
+        x_range = [0.0, 0.2]
+        y_range = [0.4, 0.6]
+        z_fixed = 0.05  # fixed height
+
+        offset = 0.04  # minimum distance between blocks to avoid overlap
+
+        # Randomly select the arrangement pattern: 0 = horizontal (along X), 1 = vertical (along Y).
+        mode = self._random.choice([0, 1])
+
+        # Divide the corresponding dimension into three equal-length sub-intervals.
+        if mode == 0:  # Horizontal arrangement: X is divided into three segments
+            x_min, x_max = x_range
+            x_segments = np.linspace(x_min, x_max, 4)  # [x0,x1,x2,x3]
+            all_poses = []
+            for i in range(3):
+                x_low = x_segments[i] + offset
+                x_high = x_segments[i + 1] - offset
+                x = self._random.uniform(x_low, x_high)
+                y = self._random.uniform(y_range[0], y_range[1])
+                z = z_fixed
+                quat = np.array([1, 0, 0, 0])
+                pose = np.concatenate([[x, y, z], quat])  # 7 dim pose
+                all_poses.append(pose)
+        else:  # Vertical arrangement: Y is divided into three segments
+            y_min, y_max = y_range
+            y_segments = np.linspace(y_min, y_max, 4)
+            all_poses = []
+            for i in range(3):
+                x = self._random.uniform(x_range[0], x_range[1])
+                y_low = y_segments[i] + offset
+                y_high = y_segments[i + 1] - offset
+                y = self._random.uniform(y_low, y_high)
+                z = z_fixed
+                quat = np.array([1, 0, 0, 0])
+                pose = np.concatenate([[x, y, z], quat])
+                all_poses.append(pose)
+
+        # Randomly shuffle the order of the three positions to decouple color from position.
+        self._random.shuffle(all_poses)
+
+        return np.concatenate(all_poses)  # 21 dim pose

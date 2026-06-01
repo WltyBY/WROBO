@@ -97,6 +97,7 @@ class AlohaDataCollector:
             print(f"EE phase: Success, return={ee_return}")
         else:
             print(f"EE phase: Failed (max reward {ee_max})")
+            return False
 
         joint_traj = [t.observation["proprio_state"] for t in episode_ee]
         gripper_ctrl_traj = [t.observation["gripper_ctrl"] for t in episode_ee]
@@ -123,7 +124,8 @@ class AlohaDataCollector:
             ax = plt.subplot()
             plt_img = ax.imshow(ts.observation[self.render_cam_name])
             plt.ion()
-
+        
+        success_step = None
         for t in range(len(joint_traj)):
             action = joint_traj[t]
             ts = self.env.step(action)
@@ -131,9 +133,18 @@ class AlohaDataCollector:
             if self.onscreen_render:
                 plt_img.set_data(ts.observation[self.render_cam_name])
                 plt.pause(0.02)
+            
+            if ts.reward is not None and ts.reward == self.env.task.max_reward:
+                print(f"Replay phase: Max reward reached at step {t}, stopping early.")
+                success_step = t
+                break
 
         if self.onscreen_render:
             plt.close()
+
+        if success_step is not None:
+            joint_traj = joint_traj[:success_step+1]
+            episode_replay = episode_replay[:success_step+2] 
 
         # check success based on rewards obtained in ee_env
         sim_return = np.sum([t.reward for t in episode_replay[1:]])
@@ -147,8 +158,8 @@ class AlohaDataCollector:
         # ---------- Save Data ----------
         # align timesteps: drop the last one to make sure obs/action length match max_timesteps
         # num_states = num_actions + 1, so we drop the last state to make them equal
-        joint_traj = joint_traj[:-1]  # change length to episode_len
-        episode_replay = episode_replay[:-1]  # length becomes episode_len + 1
+        joint_traj = joint_traj[:-1] if len(joint_traj) > 1 else joint_traj  # change length to episode_len
+        episode_replay = episode_replay[:-1] if len(episode_replay) > 1 else episode_replay  # length becomes episode_len + 1
         max_timesteps = len(joint_traj)  # i.e., episode_len
 
         if self.skip_failure and not success_flag:

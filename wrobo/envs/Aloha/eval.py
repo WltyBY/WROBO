@@ -45,6 +45,12 @@ class AlohaEvaluator:
         else:
             self.amp_dtype = torch.float16
 
+        self._load_model()
+
+        self.env = None
+        self.env_max_reward = None
+        self._init_env()
+
         self.eval_log_dir = os.path.join(
             self.log_dir,
             f"eval_{self.ckpt_name.replace('.pth', '')}_max_timestep_{self.max_timesteps}_temporal_agg_{self.temporal_agg}",
@@ -53,12 +59,6 @@ class AlohaEvaluator:
         self.log_file = os.path.join(self.eval_log_dir, "log.txt")
         with open(self.log_file, "w"):
             pass  # create or clear log file
-
-        self._load_model()
-
-        self.env = None
-        self.env_max_reward = None
-        self._init_env()
 
     def get_eval_args(self, eval_args):
         self.log_dir = eval_args.log_dir
@@ -126,7 +126,10 @@ class AlohaEvaluator:
 
     def _load_model(self) -> None:
         self.policy = ACTTrainer.get_policy(self.policy_config)
-        self.state_dim = self.policy.config["proprio_dim"]
+        self.action_dim = self.policy.config.get("action_dim")
+        if self.action_dim is None:
+            self.action_dim = len(self.norm_stats["action_abs"]["mean"])
+
         self.history_width = self.policy.config["history_width"]
         load_pretrained_weights(self.policy, os.path.join(self.log_dir, self.ckpt_name))
 
@@ -141,6 +144,8 @@ class AlohaEvaluator:
     def _init_env(self) -> None:
         self.env = make_sim_env(self.task_name, self.random_seed)
         self.env_max_reward = self.env.task.max_reward
+        if self.max_timesteps is None:
+            self.max_timesteps = self.env.task.episode_len
 
     def _pre_process(self, data: np.ndarray, key: str) -> np.ndarray:
         mean = np.asarray(self.norm_stats[key]["mean"])
@@ -157,7 +162,7 @@ class AlohaEvaluator:
             cam_names = list(video[0].keys())
             h, w, _ = video[0][cam_names[0]].shape
             w = w * len(cam_names)
-            fps = int(1 / dt)
+            fps = round(1 / dt)
             out = cv2.VideoWriter(
                 video_path, cv2.VideoWriter_fourcc(*"mp4v"), fps, (w, h)
             )
@@ -238,8 +243,13 @@ class AlohaEvaluator:
                     [
                         self.max_timesteps,
                         self.max_timesteps + num_queries,
-                        self.state_dim,
+                        self.action_dim,
                     ],
+                    device=self.device,
+                )
+                all_time_masks = torch.zeros(
+                    [self.max_timesteps, self.max_timesteps + num_queries],
+                    dtype=torch.bool,
                     device=self.device,
                 )
 
@@ -247,6 +257,7 @@ class AlohaEvaluator:
             qpos_list = []
             target_qpos_list = []
             rewards = []
+            num_steps_lst = []
 
             for t in range(self.max_timesteps):
                 if self.onscreen_render:
@@ -316,19 +327,22 @@ class AlohaEvaluator:
 
                 if self.temporal_agg:
                     all_time_actions[[t], t : t + num_queries] = all_actions
+                    all_time_masks[[t], t : t + num_queries] = True
+
                     actions_for_curr_step = all_time_actions[
                         :, t
                     ]  # (max_timesteps, action_dim)
-                    mask = (actions_for_curr_step != 0).all(dim=1)
-                    actions_for_curr_step = actions_for_curr_step[mask]
-                    if len(actions_for_curr_step) > 0:
+                    mask = all_time_masks[:, t]
+
+                    if mask.any():
+                        valid_actions = actions_for_curr_step[mask]
                         k = 0.01
-                        exp_weights = np.exp(-k * np.arange(len(actions_for_curr_step)))
+                        exp_weights = np.exp(-k * np.arange(len(valid_actions)))
                         exp_weights = exp_weights / exp_weights.sum()
                         exp_weights = (
                             torch.from_numpy(exp_weights).to(self.device).unsqueeze(1)
                         )
-                        raw_action = (actions_for_curr_step * exp_weights).sum(
+                        raw_action = (valid_actions * exp_weights).sum(
                             dim=0, keepdim=True
                         )
                     else:
@@ -344,6 +358,12 @@ class AlohaEvaluator:
                 target_qpos_list.append(action)
                 rewards.append(ts.reward)
 
+                if ts.reward is not None and ts.reward == self.env_max_reward:
+                    self.print_to_log_file(
+                        f"Rollout {rollout_id}: Max reward reached at step {t}/{self.max_timesteps}, ending rollout."
+                    )
+                    break
+
             if self.onscreen_render:
                 plt.close(fig)
                 plt.ioff()
@@ -353,6 +373,7 @@ class AlohaEvaluator:
             highest_reward = np.max(rewards_arr)
             episode_returns.append(episode_return)
             highest_rewards.append(highest_reward)
+            num_steps_lst.append(len(rewards))
 
             self.print_to_log_file(
                 f"Rollout {rollout_id:2d}: return = {episode_return:6.2f}, "
@@ -373,12 +394,21 @@ class AlohaEvaluator:
         avg_infer_time_sec = np.mean(model_infer_time)
         avg_infer_time_ms = avg_infer_time_sec * 1000.0
         infer_fps = 1.0 / avg_infer_time_sec
-        gpu_name = torch.cuda.get_device_name(self.device) if self.device.type == 'cuda' else "CPU"
-        
+        gpu_name = (
+            torch.cuda.get_device_name(self.device)
+            if self.device.type == "cuda"
+            else "CPU"
+        )
+
         self.print_to_log_file("")
         self.print_to_log_file(f"Success rate: {success_rate:.2%}")
         self.print_to_log_file(f"Average return: {avg_return:.2f}")
-        self.print_to_log_file(f"Average Model inference time: {avg_infer_time_ms:.2f} ms")
+        self.print_to_log_file(
+            f"Number of steps: Mean: {np.mean(num_steps_lst):.2f}, Max: {np.max(num_steps_lst)}, Min: {np.min(num_steps_lst)}"
+        )
+        self.print_to_log_file(
+            f"Average Model inference time: {avg_infer_time_ms:.2f} ms"
+        )
         self.print_to_log_file(f"Inference FPS: {infer_fps:.2f} Hz")
         self.print_to_log_file(f"Device: {gpu_name}")
         self.print_to_log_file("")
@@ -464,8 +494,7 @@ def build_eval_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--max_timesteps",
         type=int,
-        default=400,
-        help="Maximum timesteps per rollout",
+        help="Maximum timesteps per rollout. If not specified, will use the episode length defined in the environment.",
     )
     p.add_argument(
         "--gpu",

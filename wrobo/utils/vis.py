@@ -68,7 +68,7 @@ def visualize_hdf5_video(hdf5_path, image_dataset_path="observations/image_top",
 
 
 if __name__ == "__main__":
-    hdf5_file_path = "./Dataset/ACT_wrobo/sim_insertion/episode_0.hdf5"
+    hdf5_file_path = "./Dataset/ACT_wrobo/sim_transfer_cube_stack/episode_1.hdf5"
     vis_img_dataset = "observations/image_right_wrist"
     print_h5_structure(hdf5_file_path)
     visualize_hdf5_video(hdf5_file_path, vis_img_dataset, delay=0.02)
