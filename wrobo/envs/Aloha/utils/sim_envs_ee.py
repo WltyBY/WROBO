@@ -18,7 +18,7 @@ from wrobo.envs.Aloha.utils.constants import (
 )
 
 
-def make_ee_sim_env(task_name, random_seed=319):
+def make_ee_sim_env(task_name, random_seed=319, max_timestep=None):
     """
     Environment for simulated robot bi-manual manipulation, with end-effector control.
     Action space:      [left_arm_pose (7),             # position and quaternion for end effector
@@ -43,7 +43,9 @@ def make_ee_sim_env(task_name, random_seed=319):
         env = control.Environment(
             physics,
             task,
-            time_limit=50,  # longer time limit for stacking
+            time_limit=(
+                task.episode_len * DT if max_timestep is None else max_timestep
+            ),  # longer time limit for stacking
             control_timestep=DT,
             n_sub_steps=None,
             flat_observation=False,
@@ -55,7 +57,7 @@ def make_ee_sim_env(task_name, random_seed=319):
         env = control.Environment(
             physics,
             task,
-            time_limit=20,
+            time_limit=task.episode_len * DT if max_timestep is None else max_timestep,
             control_timestep=DT,
             n_sub_steps=None,
             flat_observation=False,
@@ -67,7 +69,7 @@ def make_ee_sim_env(task_name, random_seed=319):
         env = control.Environment(
             physics,
             task,
-            time_limit=20,
+            time_limit=task.episode_len * DT if max_timestep is None else max_timestep,
             control_timestep=DT,
             n_sub_steps=None,
             flat_observation=False,

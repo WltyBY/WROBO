@@ -19,7 +19,7 @@ from wrobo.envs.Aloha.utils.constants import (
 BOX_POSE = [None]
 
 
-def make_sim_env(task_name, random_seed=319):
+def make_sim_env(task_name, random_seed=319, max_timestep=None):
     """
     Environment for simulated robot bi-manual manipulation, with joint position control
     Action space:      [left_arm_qpos (6),             # absolute joint position
@@ -44,7 +44,9 @@ def make_sim_env(task_name, random_seed=319):
         env = control.Environment(
             physics,
             task,
-            time_limit=50,          # longer time limit for stacking
+            time_limit=(
+                task.episode_len * DT if max_timestep is None else max_timestep
+            ),  # longer time limit for stacking
             control_timestep=DT,
             n_sub_steps=None,
             flat_observation=False,
@@ -56,7 +58,7 @@ def make_sim_env(task_name, random_seed=319):
         env = control.Environment(
             physics,
             task,
-            time_limit=20,
+            time_limit=task.episode_len * DT if max_timestep is None else max_timestep,
             control_timestep=DT,
             n_sub_steps=None,
             flat_observation=False,
@@ -68,7 +70,7 @@ def make_sim_env(task_name, random_seed=319):
         env = control.Environment(
             physics,
             task,
-            time_limit=20,
+            time_limit=task.episode_len * DT if max_timestep is None else max_timestep,
             control_timestep=DT,
             n_sub_steps=None,
             flat_observation=False,
@@ -404,16 +406,22 @@ class TransferCubeStackTask(BimanualViperXTask):
             return (box, part) in all_contacts or (part, box) in all_contacts
 
         touch_left_gripper = touching(target_geom, "vx300s_left/10_left_gripper_finger")
-        touch_right_gripper = touching(target_geom, "vx300s_right/10_right_gripper_finger")
+        touch_right_gripper = touching(
+            target_geom, "vx300s_right/10_right_gripper_finger"
+        )
         touch_table = touching(target_geom, "table")
 
         # get current block position
         base_idx = -21 + self.current_color_idx * 7
-        box_pos = physics.data.qpos[base_idx:base_idx+3]
+        box_pos = physics.data.qpos[base_idx : base_idx + 3]
         target_pos = self.stack_target_positions[self.stacked_count]
         dist_to_target = np.linalg.norm(box_pos - target_pos)
 
-        if dist_to_target < 0.015 and not touch_left_gripper and not touch_right_gripper:
+        if (
+            dist_to_target < 0.015
+            and not touch_left_gripper
+            and not touch_right_gripper
+        ):
             # successfully stacked the current block, update progress
             self.stacked_count += 1
             self.current_color_idx += 1
@@ -424,7 +432,7 @@ class TransferCubeStackTask(BimanualViperXTask):
             progress = 1  # successfully grasped by right arm
         if touch_left_gripper and not touch_right_gripper and not touch_table:
             progress = 2  # successfully passed to left arm
-            
+
         return self.stacked_count * 3 + progress
 
     def randomize_target_objs(self):
@@ -469,7 +477,7 @@ class TransferCubeStackTask(BimanualViperXTask):
                 quat = np.array([1, 0, 0, 0])
                 pose = np.concatenate([[x, y, z], quat])
                 all_poses.append(pose)
-        
+
         # Randomly shuffle the order of the three positions to decouple color from position.
         self._random.shuffle(all_poses)
 

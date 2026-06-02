@@ -142,7 +142,7 @@ class AlohaEvaluator:
         self.policy.eval()
 
     def _init_env(self) -> None:
-        self.env = make_sim_env(self.task_name, self.random_seed)
+        self.env = make_sim_env(self.task_name, self.random_seed, self.max_timesteps)
         self.env_max_reward = self.env.task.max_reward
         if self.max_timesteps is None:
             self.max_timesteps = self.env.task.episode_len
@@ -219,6 +219,7 @@ class AlohaEvaluator:
         episode_returns = []
         highest_rewards = []
         model_infer_time = []
+        num_steps_lst = []
 
         for rollout_id in range(self.num_rollouts):
             rn_ = self.env._task.randomize_target_objs()
@@ -257,7 +258,6 @@ class AlohaEvaluator:
             qpos_list = []
             target_qpos_list = []
             rewards = []
-            num_steps_lst = []
 
             for t in range(self.max_timesteps):
                 if self.onscreen_render:
@@ -360,7 +360,7 @@ class AlohaEvaluator:
 
                 if ts.reward is not None and ts.reward == self.env_max_reward:
                     self.print_to_log_file(
-                        f"Rollout {rollout_id}: Max reward reached at step {t}/{self.max_timesteps}, ending rollout."
+                        f"Rollout {rollout_id:3d}: Max reward reached at step {t}/{self.max_timesteps}, ending rollout."
                     )
                     break
 
@@ -369,17 +369,21 @@ class AlohaEvaluator:
                 plt.ioff()
 
             rewards_arr = np.array(rewards)
-            episode_return = np.sum(rewards_arr[rewards_arr != None])
+            episode_return = np.sum(rewards_arr) - len(
+                rewards
+            )  # subtract the negative step penalty to get actual return
             highest_reward = np.max(rewards_arr)
+
             episode_returns.append(episode_return)
             highest_rewards.append(highest_reward)
             num_steps_lst.append(len(rewards))
 
             self.print_to_log_file(
-                f"Rollout {rollout_id:2d}: return = {episode_return:6.2f}, "
+                f"Rollout {rollout_id:3d}: return = {episode_return:6.2f}, "
                 f"highest_reward = {highest_reward}, max_reward = {self.env_max_reward}, "
                 f"success = {highest_reward == self.env_max_reward}"
             )
+            self.print_to_log_file("")
 
             if save_episode:
                 video_path = os.path.join(
@@ -388,8 +392,11 @@ class AlohaEvaluator:
                 )
                 self._save_videos(image_list, DT, video_path=video_path)
 
-        success_rate = np.mean(np.array(highest_rewards) == self.env_max_reward)
+        success_mask = np.array(highest_rewards) == self.env_max_reward
+        success_rate = np.mean(success_mask)
         avg_return = np.mean(episode_returns)
+        num_steps_lst_success = np.array(num_steps_lst)[success_mask]
+        num_steps_lst_fail = np.array(num_steps_lst)[~success_mask]
 
         avg_infer_time_sec = np.mean(model_infer_time)
         avg_infer_time_ms = avg_infer_time_sec * 1000.0
@@ -400,11 +407,22 @@ class AlohaEvaluator:
             else "CPU"
         )
 
-        self.print_to_log_file("")
         self.print_to_log_file(f"Success rate: {success_rate:.2%}")
         self.print_to_log_file(f"Average return: {avg_return:.2f}")
         self.print_to_log_file(
+            f"Average return for successful episodes: {np.mean(np.array(episode_returns)[success_mask]):.2f}"
+        )
+        self.print_to_log_file(
+            f"Average return for failed episodes: {np.mean(np.array(episode_returns)[~success_mask]):.2f}"
+        )
+        self.print_to_log_file(
             f"Number of steps: Mean: {np.mean(num_steps_lst):.2f}, Max: {np.max(num_steps_lst)}, Min: {np.min(num_steps_lst)}"
+        )
+        self.print_to_log_file(
+            f"Steps for successful episodes: Mean: {np.mean(num_steps_lst_success):.2f}, Max: {np.max(num_steps_lst_success)}, Min: {np.min(num_steps_lst_success)}"
+        )
+        self.print_to_log_file(
+            f"Steps for failed episodes: Mean: {np.mean(num_steps_lst_fail):.2f}, Max: {np.max(num_steps_lst_fail)}, Min: {np.min(num_steps_lst_fail)}"
         )
         self.print_to_log_file(
             f"Average Model inference time: {avg_infer_time_ms:.2f} ms"
