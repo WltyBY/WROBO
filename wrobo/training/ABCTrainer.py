@@ -90,7 +90,7 @@ class DDPABCTrainer(ABC):
         )
         assert self.method_name is not None
         self.logs_output_folder = os.path.join(
-            "./Logs",
+            self.log_dir,
             self.method_name,
             task_general_names,
             hyperparams_name,

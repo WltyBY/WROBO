@@ -19,7 +19,9 @@ class PolyLRScheduler(_LRScheduler):
     ):
         self.max_steps = max_steps
         self.warmup_steps = warmup_steps
-        self.decay_steps = max_steps - warmup_steps
+        # Guard against max_steps <= warmup_steps, which would make decay_steps
+        # zero/negative and cause a ZeroDivisionError (or invalid decay) in get_lr.
+        self.decay_steps = max(max_steps - warmup_steps, 1)
         self.exponent = exponent
 
         # backup initial_lr for each group
@@ -29,7 +31,7 @@ class PolyLRScheduler(_LRScheduler):
 
     def get_lr(self):
         """Compute lr for each group."""
-        if self.last_epoch < self.warmup_steps:
+        if self.warmup_steps > 0 and self.last_epoch < self.warmup_steps:
             # Linear warmup: increase from 0 to initial_lr
             warmup_percent = self.last_epoch / self.warmup_steps
             return [

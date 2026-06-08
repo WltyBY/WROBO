@@ -33,7 +33,7 @@ class AlohaDataCollector:
         self.num_episodes = collect_args.num_episodes
         self.inject_noise = collect_args.inject_noise
         self.onscreen_render = collect_args.onscreen_render
-        self.render_cam_name = "image_angle"
+        self.render_cam_name = collect_args.render_cam_name
         self.skip_failure = collect_args.skip_failure
         self.random_seed = collect_args.seed
 

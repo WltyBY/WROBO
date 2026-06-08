@@ -17,7 +17,7 @@ class ConstantLRScheduler(_LRScheduler):
 
     def get_lr(self):
         """Return constant initial_lr for each group."""
-        if self.last_epoch < self.warmup_steps:
+        if self.warmup_steps > 0 and self.last_epoch < self.warmup_steps:
             # Linear warmup: increase from 0 to initial_lr
             warmup_percent = self.last_epoch / self.warmup_steps
             return [
