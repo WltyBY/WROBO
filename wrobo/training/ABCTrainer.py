@@ -323,8 +323,9 @@ class DDPABCTrainer(ABC):
             splits_path = os.path.join(self.dataset_dir, "dataset_split.json")
             if not os.path.exists(splits_path):
                 self.print_to_log_file(
-                    f"Dataset split not found under {self.dataset_dir}. Creating new splits..."
+                    f"Dataset split not found under {self.dataset_dir}."
                 )
+                self.print_to_log_file("Creating new splits...")
 
                 case_lst = [
                     f.replace(".hdf5", "")
@@ -354,8 +355,10 @@ class DDPABCTrainer(ABC):
             norm_stats_path = os.path.join(self.logs_output_folder, "norm_stats.json")
             if not os.path.exists(norm_stats_path):
                 self.print_to_log_file(
-                    f"Norm stats not found under {self.logs_output_folder}. Creating new stats..."
+                    f"Norm stats not found under {self.logs_output_folder}."
                 )
+                self.print_to_log_file("Creating new stats...")
+                
                 dataset_split = open_json(
                     os.path.join(self.dataset_dir, "dataset_split.json")
                 )
