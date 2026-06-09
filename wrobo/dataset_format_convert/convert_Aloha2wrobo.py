@@ -4,9 +4,18 @@ import h5py
 import numpy as np
 
 from wrobo.utils.vis import print_h5_structure
+from wrobo.utils.image_codec import create_image_dataset
 
 
-def convert_hdf5_format(src_path, dst_path, comment, dataset_name="ACT", success=True):
+def convert_hdf5_format(
+    src_path,
+    dst_path,
+    comment,
+    dataset_name="ACT",
+    success=True,
+    img_encoding="png",
+    jpeg_quality=95,
+):
     with h5py.File(src_path, "r", rdcc_nbytes=1024**2 * 2) as src, h5py.File(
         dst_path, "w", rdcc_nbytes=1024**2 * 2
     ) as dst:
@@ -16,20 +25,18 @@ def convert_hdf5_format(src_path, dst_path, comment, dataset_name="ACT", success
 
         obs_grp = dst.create_group("observations")
 
-        # images: (T, H, W, C) -> (T, C, H, W)
+        # images: (T, H, W, C) -> per-frame (C, H, W) RGB, stored per img_encoding
         img_src = src["observations/images/top"][:]  # shape: (T, H, W, C)
-        T, H, W, C = img_src.shape
+        T, *_ = img_src.shape
         dst.attrs["seq_len"] = T
 
-        img_target = np.transpose(img_src, (0, 3, 1, 2))  # (T, C, H, W)
-        obs_grp.create_dataset(
+        frames_chw = [np.transpose(img_src[t], (2, 0, 1)) for t in range(T)]
+        create_image_dataset(
+            obs_grp,
             "image_top",
-            data=img_target,
-            dtype="uint8",
-            compression="gzip",
-            compression_opts=4,
-            shuffle=True,
-            chunks=(1, C, H, W),
+            frames_chw,
+            encoding=img_encoding,
+            jpeg_quality=jpeg_quality,
         )
 
         # qpos -> proprio_state
@@ -71,6 +78,8 @@ def convert_hdf5_format(src_path, dst_path, comment, dataset_name="ACT", success
 
 if __name__ == "__main__":
     comment = "sim_transfer_cube_compressed"
+    img_encoding = "png"  # "raw" (legacy) | "png" (lossless) | "jpg" (lossy, smallest)
+    jpeg_quality = 95
     folder_path = "./Dataset/ACT/sim_transfer_cube_scripted/"
     saved_folder = f"./Dataset/ACT_wrobo/{comment}/"
     file_path_lst = [
@@ -83,7 +92,11 @@ if __name__ == "__main__":
     print_h5_structure(file_path_lst[0])
     for file in file_path_lst:
         convert_hdf5_format(
-            file, os.path.join(saved_folder, os.path.basename(file)), comment
+            file,
+            os.path.join(saved_folder, os.path.basename(file)),
+            comment,
+            img_encoding=img_encoding,
+            jpeg_quality=jpeg_quality,
         )
 
     saved_file_path_lst = [

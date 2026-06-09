@@ -26,7 +26,13 @@ from wrobo.utils.file_operations import (
 from wrobo.utils.dataset_statistic import get_norm_stats
 from wrobo.utils.json_export import recursive_fix_for_json_export
 from wrobo.utils.load_model_weights import load_pretrained_weights
-from wrobo.utils.others import empty_cache
+from wrobo.training.utils.mics import (
+    empty_cache,
+    get_rank,
+    get_world_size,
+    is_dist_avail_and_initialized,
+    is_main_process,
+)
 from wrobo.utils.collate_outputs import collate_outputs
 from wrobo.training.utils.logger import TensorBoardLogger
 from wrobo.training.dataloader.sampler import InfiniteSampler
@@ -73,7 +79,7 @@ class DDPABCTrainer(ABC):
             self.random_seed,
             self.pretrained_weight is not None,
         )
-        
+
         # hyperparameter
         hyperparams_name = (
             "WRITE_THE_HYPERPARAMETERS_OF_THE_METHOD_LIKE_task_general_names"
@@ -97,7 +103,7 @@ class DDPABCTrainer(ABC):
             "fold_" + self.fold,
         )
 
-        if self.is_main_process():
+        if is_main_process():
             os.makedirs(self.logs_output_folder, exist_ok=True)
             self.log_file = os.path.join(self.logs_output_folder, time_ + ".txt")
             with open(self.log_file, "w"):
@@ -113,7 +119,7 @@ class DDPABCTrainer(ABC):
         self.check_dataset_split()
         self.check_norm_stats()
 
-        if self.is_main_process():
+        if is_main_process():
             os.makedirs(config_and_code_save_path, exist_ok=True)
 
             self.print_to_log_file(
@@ -139,12 +145,12 @@ class DDPABCTrainer(ABC):
         if torch.cuda.is_bf16_supported():
             self.amp_dtype = torch.bfloat16
             self.grad_scaler = None  # BF16 don't need grad scaler
-            if self.is_main_process():
+            if is_main_process():
                 self.print_to_log_file("Using BF16 precision for training.")
         else:
             self.amp_dtype = torch.float16
             self.grad_scaler = GradScaler() if self.device.type == "cuda" else None
-            if self.is_main_process():
+            if is_main_process():
                 self.print_to_log_file(
                     "Using FP16 precision for training with GradScaler."
                 )
@@ -183,7 +189,7 @@ class DDPABCTrainer(ABC):
             # build network
             self.network = self.get_networks(self.config_dict["Policy"])
             if self.pretrained_weight is not None:
-                if self.is_main_process():
+                if is_main_process():
                     self.print_to_log_file(
                         f"Loading pretrained weight from {self.pretrained_weight}"
                     )
@@ -200,7 +206,7 @@ class DDPABCTrainer(ABC):
                 )
 
             if self.do_compile:
-                if self.is_main_process():
+                if is_main_process():
                     self.print_to_log_file("Compiling network...")
                     warnings.warn(
                         "⚠️ Find you use --do_compile during training, which can significantly speed up the training."
@@ -313,7 +319,7 @@ class DDPABCTrainer(ABC):
         pass
 
     def check_dataset_split(self):
-        if self.is_main_process():
+        if is_main_process():
             splits_path = os.path.join(self.dataset_dir, "dataset_split.json")
             if not os.path.exists(splits_path):
                 self.print_to_log_file(
@@ -344,7 +350,7 @@ class DDPABCTrainer(ABC):
         Get normalization stats (e.g. mean and std) for the dataset, which can be used in data normalization.
         You can compute the stats from the dataset or just set them to some fixed values.
         """
-        if self.is_main_process():
+        if is_main_process():
             norm_stats_path = os.path.join(self.logs_output_folder, "norm_stats.json")
             if not os.path.exists(norm_stats_path):
                 self.print_to_log_file(
@@ -369,15 +375,12 @@ class DDPABCTrainer(ABC):
             self.print_to_log_file(f"Using norm stats from {norm_stats_path}")
         self.sync_processes()
 
-    def is_main_process(self):
-        return (not self.is_ddp) or self.rank == 0
-
     def sync_processes(self):
         if self.is_ddp:
             dist.barrier(device_ids=[self.device.index])
 
     def get_logger(self):
-        if self.is_main_process():
+        if is_main_process():
             return TensorBoardLogger(self.logs_output_folder)
         else:
             return None
@@ -402,13 +405,13 @@ class DDPABCTrainer(ABC):
                 break
 
         if has_bn:
-            if self.is_main_process():
+            if is_main_process():
                 self.print_to_log_file(
                     "[DDP] BatchNorm detected → converting to SyncBatchNorm"
                 )
             model = nn.SyncBatchNorm.convert_sync_batchnorm(model)
         else:
-            if self.is_main_process():
+            if is_main_process():
                 self.print_to_log_file(
                     "[DDP] No BatchNorm detected → skip SyncBatchNorm"
                 )
@@ -466,18 +469,17 @@ class DDPABCTrainer(ABC):
             device = torch.device(f"cuda:{local_rank}")
             torch.cuda.set_device(device)
 
-            if not dist.is_initialized():
+            if not is_dist_avail_and_initialized():
                 dist.init_process_group(backend="nccl", init_method="env://")
-
-            self.rank = dist.get_rank()
-            self.world_size = dist.get_world_size()
         else:
-            self.rank = 0
-            self.world_size = 1
             device = torch.device("cuda:0" if use_cuda else "cpu")
 
         self.is_ddp = ddp
-        
+        # When DDP is not active these helpers fall back to rank 0 / world_size 1,
+        # so they are equivalent to the previous explicit assignments.
+        self.rank = get_rank()
+        self.world_size = get_world_size()
+
         return device
 
     def _build_deep_supervision_loss_object(self, loss, num_deep_supervision_scales):
@@ -533,11 +535,11 @@ class DDPABCTrainer(ABC):
         torch.cuda.manual_seed_all(seed)
 
     def print_to_log_file(self, *args, also_print_to_console=True, add_timestamp=True):
-        if not self.is_main_process() or self.log_file is None:
+        if not is_main_process() or self.log_file is None:
             if also_print_to_console:
                 print(*args)
             return
-        
+
         timestamp = time()
         if add_timestamp:
             args = (f"{datetime.fromtimestamp(timestamp)}:", *args)
@@ -582,7 +584,7 @@ class DDPABCTrainer(ABC):
             filename: Full checkpoint file path (contains training state)
         """
         # Only the main process writes checkpoints to avoid concurrent writes.
-        if not self.is_main_process():
+        if not is_main_process():
             return
 
         # Skip saving if checkpointing is disabled
@@ -616,7 +618,7 @@ class DDPABCTrainer(ABC):
         """
         Load checkpoint and training state.
         """
-        if self.is_main_process():
+        if is_main_process():
             self.print_to_log_file("Loading checkpoint...")
 
         if not self.was_initialized:
@@ -625,7 +627,7 @@ class DDPABCTrainer(ABC):
         if isinstance(filename_or_checkpoint, str):
             if self.is_ddp:
                 checkpoint_holder = [None]
-                if self.is_main_process():
+                if is_main_process():
                     checkpoint_holder[0] = torch.load(
                         filename_or_checkpoint,
                         map_location=self.device,
@@ -661,7 +663,7 @@ class DDPABCTrainer(ABC):
 
         self.current_epoch = checkpoint["current_epoch"] + 1
 
-        if self.is_main_process() and self.logger is not None:
+        if is_main_process() and self.logger is not None:
             self.logger.load_checkpoint(checkpoint["logging"])
 
         self.optimizer.load_state_dict(checkpoint["optimizer_state"])
@@ -675,7 +677,7 @@ class DDPABCTrainer(ABC):
 
         self._best_ema = checkpoint.get("best_ema")
 
-        if self.is_main_process():
+        if is_main_process():
             self.print_to_log_file(f"Resumed training from epoch {self.current_epoch}")
 
     def run_training(self):
@@ -726,7 +728,7 @@ class DDPABCTrainer(ABC):
 
             self.train_end()
         finally:
-            if self.is_ddp and dist.is_initialized():
+            if self.is_ddp and is_dist_avail_and_initialized():
                 dist.destroy_process_group()
 
     def train_start(self):
@@ -742,7 +744,7 @@ class DDPABCTrainer(ABC):
         # through self.dataloader_train, self.dataloader_val = self.get_train_and_val_dataloader().
         final_ckpt = os.path.join(self.logs_output_folder, "checkpoint_final.pth")
         if os.path.isfile(final_ckpt):
-            if self.is_main_process():
+            if is_main_process():
                 self.print_to_log_file(
                     f"{final_ckpt} exists – training already finished."
                 )
@@ -773,7 +775,7 @@ class DDPABCTrainer(ABC):
                 self.dataloader_val._iterator._shutdown_workers()
             del self.dataloader_val
 
-        if self.is_main_process() and (not self.already_finish_training):
+        if is_main_process() and (not self.already_finish_training):
             # save final checkpoint
             self.save_checkpoint(
                 os.path.join(self.logs_output_folder, "checkpoint_final.pth")
@@ -786,7 +788,7 @@ class DDPABCTrainer(ABC):
 
         empty_cache(self.device)
 
-        if self.is_main_process():
+        if is_main_process():
             if self.logger is not None:
                 self.logger.close()
             self.print_to_log_file("Training done.")
@@ -799,13 +801,13 @@ class DDPABCTrainer(ABC):
                     sampler.set_epoch(epoch)
 
         # only rank 0 or the main process
-        if self.is_main_process():
+        if is_main_process():
             self.logger.log("epoch_start_timestamps", time(), epoch)
 
     def epoch_end(self, epoch):
         self.sync_processes()
         # only rank 0 should do logging / saving / printing
-        if self.is_main_process():
+        if is_main_process():
 
             self.logger.log("epoch_end_timestamps", time(), epoch)
 
@@ -859,7 +861,7 @@ class DDPABCTrainer(ABC):
         self.network.train()
         self.lr_scheduler.step(epoch)
 
-        if self.is_main_process():
+        if is_main_process():
             self.print_to_log_file("")
             self.print_to_log_file(f"Epoch {epoch}")
             lr_info = []
@@ -893,7 +895,7 @@ class DDPABCTrainer(ABC):
 
             log_dict[f"Train/{key}"] = value
 
-        if self.is_main_process():
+        if is_main_process():
             self.logger.log_for_dict(log_dict, epoch)
 
     def validation_epoch_start(self):
@@ -923,5 +925,5 @@ class DDPABCTrainer(ABC):
 
             log_dict[f"Val/{key}"] = value
 
-        if self.is_main_process():
+        if is_main_process():
             self.logger.log_for_dict(log_dict, epoch)

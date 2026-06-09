@@ -1,6 +1,7 @@
 import os
 import h5py
 import torch
+import warnings
 
 import numpy as np
 
@@ -9,6 +10,7 @@ from collections import OrderedDict
 from torch.utils.data import Dataset
 
 from wrobo.utils.file_operations import open_json
+from wrobo.utils.image_codec import get_encoding, decode_frames, RAW
 
 
 class EpisodicDataset(Dataset):
@@ -75,16 +77,18 @@ class EpisodicDataset(Dataset):
 
         data_dict = dict()
         root = self._get_h5_file(episode_path)
-        episode_len = dict(root.attrs)["seq_len"]
+        episode_len = root.attrs["seq_len"]
 
         # sample a timestep
         if self.biased_sample:
-            # bias towards sampling later timesteps, which have more future and complex actions
+            # bias towards sampling later timesteps, which have more future and complex actions.
+            # u in [0, 1] -> map to [0, episode_len-1] to match the uniform branch's range
+            # (randint(episode_len) covers [0, L-1]); min() guards the u==1.0 edge.
             u = np.random.beta(a=2.0, b=1.0)
-            sample_ts = int(u * (episode_len - 1))
+            sample_ts = min(int(u * episode_len), episode_len - 1)
         else:
             sample_ts = np.random.randint(episode_len)
-            
+
         for key in self.data_keys:
             # assert (
             #     "/" + key in root
@@ -92,6 +96,9 @@ class EpisodicDataset(Dataset):
 
             if key.startswith("observations"):
                 obs_seq = root["/" + key]
+                # image datasets may be stored as per-frame encoded byte strings;
+                # capture the encoding now (slicing returns a plain array w/o attrs).
+                img_encoding = get_encoding(obs_seq) if "image" in key else RAW
 
                 start_idx = sample_ts - self.history_width + 1
                 end_idx = sample_ts + 1
@@ -113,6 +120,13 @@ class EpisodicDataset(Dataset):
                     obs_chunk = obs_seq[start_idx:end_idx]
 
                 if "image" in key:
+                    # Decode per-frame byte strings back to a dense (his_width, C, H, W)
+                    # uint8 array if the dataset is encoded (png/jpg); "raw" is already
+                    # a dense array. Padding above operated on the (object) byte strings,
+                    # which is fine since np.repeat/concatenate just duplicate elements.
+                    if img_encoding != RAW:
+                        obs_chunk = decode_frames(obs_chunk)
+
                     # For image
                     obs = torch.from_numpy(
                         obs_chunk
@@ -121,8 +135,45 @@ class EpisodicDataset(Dataset):
                     if self.img_transforms:
                         obs = torch.stack([self.img_transforms(frame) for frame in obs])
                     else:
-                        obs = obs.float() / 255.0
+                        # No transform: scale to [0, 1] then normalize per-channel with
+                        # the dataset's image stats (computed on /255 pixels in
+                        # get_norm_stats), mirroring ToTensor + Normalize.
+                        obs = obs.float() / 255.0  # (his_width, C, H, W)
+                        norm_key = key.replace("observations/", "")
+                        if norm_key in self.norm_stats:
+                            # stats are per-channel (C,); broadcast over H, W
+                            mean = torch.as_tensor(
+                                self.norm_stats[norm_key]["mean"], dtype=torch.float32
+                            ).view(1, -1, 1, 1)
+                            std = torch.as_tensor(
+                                self.norm_stats[norm_key]["std"], dtype=torch.float32
+                            ).view(1, -1, 1, 1)
+                            obs = (obs - mean) / std
+                        else:
+                            warnings.warn(
+                                f"No normalization stats for image key '{norm_key}', "
+                                "using only /255 scaling. Please check if this is intended.",
+                                UserWarning,
+                                stacklevel=2,
+                            )
                 else:
+                    # Non-image observations (e.g. proprio_state, proprio_vel) are
+                    # normalized with the same stats/formula used at inference time
+                    # (AlohaEvaluator._pre_process): (x - mean) / std. std is already
+                    # floored (>=1e-8) in get_norm_stats, so no extra epsilon is needed.
+                    norm_key = key.replace("observations/", "")
+                    obs_chunk = np.asarray(obs_chunk, dtype=np.float32)
+                    if norm_key in self.norm_stats:
+                        mean = np.asarray(self.norm_stats[norm_key]["mean"])
+                        std = np.asarray(self.norm_stats[norm_key]["std"])
+                        obs_chunk = (obs_chunk - mean) / std
+                    else:
+                        warnings.warn(
+                            f"No normalization stats for observation key '{norm_key}', using unnormalized data. "
+                            "Please check if this is intended.",
+                            UserWarning,
+                            stacklevel=2,
+                        )
                     obs = torch.from_numpy(obs_chunk).float()
 
                 data_dict[key.replace("observations/", "")] = obs
@@ -153,10 +204,13 @@ class EpisodicDataset(Dataset):
                 if key in self.norm_stats:
                     mean = np.asarray(self.norm_stats[key]["mean"])
                     std = np.asarray(self.norm_stats[key]["std"])
-                    padded_action = (padded_action - mean) / (std + 1e-6)
+                    padded_action = (padded_action - mean) / std
                 else:
-                    print(
-                        f"Warning: no normalization stats for key {key}, using unnormalized data. Please check if this is intended."
+                    warnings.warn(
+                        f"No normalization stats for action key '{key}', using unnormalized data. "
+                        "Please check if this is intended.",
+                        UserWarning,
+                        stacklevel=2,
                     )
 
                 data_dict[key] = torch.from_numpy(padded_action).float()
@@ -170,7 +224,7 @@ class EpisodicDataset(Dataset):
             # and the model should be able to handle variable number of camera views. The model can access each camera view by data_dict["image"][i], which has shape [history_width, C, H, W].
             for key in self.cam_keys:
                 del data_dict[key]
-        
+
         return data_dict
 
     def _get_episode_ids(self):
@@ -210,7 +264,7 @@ class EpisodicDataset(Dataset):
             old_path, old_file = self._h5_cache.popitem(last=False)
             try:
                 old_file.close()
-            except:
+            except Exception:
                 pass
 
         return f
@@ -219,7 +273,7 @@ class EpisodicDataset(Dataset):
         for f in self._h5_cache.values():
             try:
                 f.close()
-            except:
+            except Exception:
                 pass
         self._h5_cache = {}
 

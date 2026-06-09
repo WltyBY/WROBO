@@ -5,10 +5,11 @@ import numpy as np
 import matplotlib.pyplot as plt
 import h5py
 
-from wrobo.envs.Aloha.utils.constants import PUPPET_GRIPPER_POSITION_NORMALIZE_FN
+from wrobo.envs.Aloha.utils.constants import PUPPET_GRIPPER_POSITION_NORMALIZE_FN, DT
 from wrobo.envs.Aloha.utils.sim_envs_ee import make_ee_sim_env
 from wrobo.envs.Aloha.utils.sim_envs import make_sim_env, BOX_POSE
 from wrobo.envs.Aloha.utils.scripted_policy import make_scripted_policy
+from wrobo.utils.image_codec import create_image_dataset
 
 
 class AlohaDataCollector:
@@ -28,7 +29,7 @@ class AlohaDataCollector:
     def get_collect_args(self, collect_args):
         self.dataset_dir = collect_args.dataset_dir
         self.task_name = collect_args.task_name
-        self.episode_len = collect_args.episode_len
+        self.max_timesteps = collect_args.max_timesteps
         self.camera_names = collect_args.camera_names
         self.num_episodes = collect_args.num_episodes
         self.inject_noise = collect_args.inject_noise
@@ -36,11 +37,27 @@ class AlohaDataCollector:
         self.render_cam_name = collect_args.render_cam_name
         self.skip_failure = collect_args.skip_failure
         self.random_seed = collect_args.seed
+        self.img_encoding = collect_args.img_encoding
+        self.jpeg_quality = collect_args.jpeg_quality
 
     def build_env(self):
-        # build sim envs based on task_name
-        self.env = make_sim_env(self.task_name, random_seed=self.random_seed)
-        self.ee_env = make_ee_sim_env(self.task_name, random_seed=self.random_seed)
+        # build sim envs based on task_name. max_timesteps (a step count) drives the
+        # env time_limit (in seconds, hence * DT) so that both the EE-phase rollout and
+        # the replay env truncate after exactly max_timesteps steps. If not provided,
+        # fall back to each task's built-in max_timesteps (max_timestep=None).
+        self.env = make_sim_env(
+            self.task_name,
+            random_seed=self.random_seed,
+            max_timestep=self.max_timesteps,
+        )
+        self.ee_env = make_ee_sim_env(
+            self.task_name,
+            random_seed=self.random_seed,
+            max_timestep=self.max_timesteps,
+        )
+        # resolve the effective step count: explicit max_timesteps, else task default.
+        if self.max_timesteps is None:
+            self.max_timesteps = self.env.task.max_timesteps
 
     def build_policy(self):
         # build policy based on task_name
@@ -79,7 +96,7 @@ class AlohaDataCollector:
             plt_img = ax.imshow(ts.observation[self.render_cam_name])
             plt.ion()
 
-        for _ in range(self.episode_len):
+        for _ in range(self.max_timesteps):
             action = self.policy(ts)
             ts = self.ee_env.step(action)
             episode_ee.append(ts)
@@ -124,7 +141,7 @@ class AlohaDataCollector:
             ax = plt.subplot()
             plt_img = ax.imshow(ts.observation[self.render_cam_name])
             plt.ion()
-        
+
         success_step = None
         for t in range(len(joint_traj)):
             action = joint_traj[t]
@@ -133,22 +150,33 @@ class AlohaDataCollector:
             if self.onscreen_render:
                 plt_img.set_data(ts.observation[self.render_cam_name])
                 plt.pause(0.02)
-            
+
             if ts.reward is not None and ts.reward == self.env.task.max_reward:
                 print(f"Replay phase: Max reward reached at step {t}, stopping early.")
                 success_step = t
+                break
+
+            # Stop once the sim env hits its time limit (LAST timestep). joint_traj can
+            # be one longer than the env's time_limit allows; stepping past it makes
+            # dm_control auto-reset and return a FIRST timestep with reward=None, which
+            # then poisons the reward reduction below.
+            if ts.last():
+                print(f"Replay phase: Reached env time limit at step {t}, stopping.")
                 break
 
         if self.onscreen_render:
             plt.close()
 
         if success_step is not None:
-            joint_traj = joint_traj[:success_step+1]
-            episode_replay = episode_replay[:success_step+2] 
+            joint_traj = joint_traj[: success_step + 1]
+            episode_replay = episode_replay[: success_step + 2]
 
-        # check success based on rewards obtained in ee_env
-        sim_return = np.sum([t.reward for t in episode_replay[1:]])
-        sim_max = np.max([t.reward for t in episode_replay[1:]])
+        # check success based on rewards obtained in sim_env. Skip the initial reset
+        # timestep (episode_replay[0], reward=None) and defensively drop any other None
+        # rewards so the reduction never sees int + None.
+        sim_rewards = [t.reward for t in episode_replay[1:] if t.reward is not None]
+        sim_return = np.sum(sim_rewards) if sim_rewards else 0.0
+        sim_max = np.max(sim_rewards) if sim_rewards else 0.0
         success_flag = sim_max == self.env.task.max_reward
         if success_flag:
             print(f"Replay phase: Success, return={sim_return}")
@@ -156,11 +184,15 @@ class AlohaDataCollector:
             print(f"Replay phase: Failed (max reward {sim_max})")
 
         # ---------- Save Data ----------
-        # align timesteps: drop the last one to make sure obs/action length match max_timesteps
+        # align timesteps: drop the last one to make sure obs/action length match
         # num_states = num_actions + 1, so we drop the last state to make them equal
-        joint_traj = joint_traj[:-1] if len(joint_traj) > 1 else joint_traj  # change length to episode_len
-        episode_replay = episode_replay[:-1] if len(episode_replay) > 1 else episode_replay  # length becomes episode_len + 1
-        max_timesteps = len(joint_traj)  # i.e., episode_len
+        joint_traj = (
+            joint_traj[:-1] if len(joint_traj) > 1 else joint_traj
+        )  # -> max_timesteps
+        episode_replay = (
+            episode_replay[:-1] if len(episode_replay) > 1 else episode_replay
+        )
+        max_timesteps = len(joint_traj)  # actual saved length (<= self.max_timesteps)
 
         if self.skip_failure and not success_flag:
             print(f"Skipping failed episode (max reward {sim_max})")
@@ -193,26 +225,23 @@ class AlohaDataCollector:
             root.attrs["dataset"] = "Aloha"
             root.attrs["success"] = success_flag
             noise_flag = "with" if self.inject_noise else "without"
-            root.attrs["comment"] = f"{self.task_name}_compressed_{noise_flag}_noise"
+            root.attrs["comment"] = (
+                f"{self.task_name}_img_{self.img_encoding}_{noise_flag}_noise"
+            )
             root.attrs["sim"] = True
             root.attrs["seq_len"] = max_timesteps
 
             obs = root.create_group("observations")
             for cam_name in self.camera_names:
-                img_src = data_dict[f"/observations/{cam_name}"]  # shape: (T, H, W, C)
-                T = len(img_src)
-                H, W, C = img_src[0].shape
-                img_target = np.transpose(
-                    np.stack(img_src, axis=0), (0, 3, 1, 2)
-                )  # (T, C, H, W)
-                obs.create_dataset(
+                img_src = data_dict[f"/observations/{cam_name}"]  # list of (H, W, C)
+                # (T, H, W, C) -> list of (C, H, W) RGB frames
+                frames_chw = [np.transpose(im, (2, 0, 1)) for im in img_src]
+                create_image_dataset(
+                    obs,
                     cam_name,
-                    data=img_target,
-                    dtype="uint8",
-                    compression="gzip",
-                    compression_opts=4,
-                    shuffle=True,
-                    chunks=(1, C, H, W),
+                    frames_chw,
+                    encoding=self.img_encoding,
+                    jpeg_quality=self.jpeg_quality,
                 )
 
             obs.create_dataset(
@@ -261,7 +290,10 @@ def get_args():
         "--task_name", type=str, required=True, help="Name of the task to perform"
     )
     parser.add_argument(
-        "--episode_len", type=int, default=400, help="Maximum timesteps per episode"
+        "--max_timesteps",
+        type=int,
+        default=None,
+        help="Maximum timesteps per episode. If not set, uses the task's built-in max_timesteps.",
     )
     parser.add_argument(
         "--camera_names",
@@ -296,6 +328,20 @@ def get_args():
     )
     parser.add_argument(
         "--seed", type=int, default=319, help="Random seed for reproducibility"
+    )
+    parser.add_argument(
+        "--img_encoding",
+        type=str,
+        default="png",
+        choices=["raw", "png", "jpg"],
+        help="How to store image frames: 'raw' (dense gzip'd uint8 array, legacy), "
+        "'png' (lossless per-frame byte strings), or 'jpg' (lossy, smallest).",
+    )
+    parser.add_argument(
+        "--jpeg_quality",
+        type=int,
+        default=95,
+        help="JPEG quality in [0, 100], only used when --img_encoding jpg.",
     )
 
     return parser.parse_args()

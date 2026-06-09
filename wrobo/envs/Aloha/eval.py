@@ -6,6 +6,7 @@ import cv2
 import torch
 import random
 import argparse
+import warnings
 
 import numpy as np
 import matplotlib.pyplot as plt
@@ -22,7 +23,7 @@ from wrobo.envs.Aloha.utils.sim_envs import make_sim_env, BOX_POSE
 from wrobo.utils.file_operations import open_yaml, open_json
 from wrobo.methods.ACT.ACTTrainer import ACTTrainer
 from wrobo.utils.load_model_weights import load_pretrained_weights
-from wrobo.utils.others import dummy_context
+from wrobo.training.utils.mics import dummy_context
 
 
 class AlohaEvaluator:
@@ -108,6 +109,40 @@ class AlohaEvaluator:
             ]
         )
 
+    def _preprocess_image(self, curr_image: np.ndarray, cam_name: str) -> torch.Tensor:
+        """
+        Preprocess a single raw camera frame (H, W, C) uint8 into a normalized
+        (C, H, W) float tensor, mirroring EpisodicDataset.__getitem__.
+
+        - If self.img_transform is set, apply it (ToTensor scales to [0, 1] and
+          Normalize uses ImageNet stats).
+        - Otherwise, fall back to /255 scaling + per-channel normalization with the
+          dataset's image stats from norm_stats, exactly as the dataset's no-transform
+          branch does. Stats are per-channel over the (C, H, W) layout, so we permute
+          (H, W, C) -> (C, H, W) before normalizing.
+        """
+        if self.img_transform is not None:
+            return self.img_transform(curr_image)  # (C, H, W)
+
+        # (H, W, C) uint8 -> (C, H, W) float in [0, 1]
+        obs = torch.from_numpy(np.asarray(curr_image)).permute(2, 0, 1).float() / 255.0
+        if cam_name in self.norm_stats:
+            mean = torch.as_tensor(
+                self.norm_stats[cam_name]["mean"], dtype=torch.float32
+            ).view(-1, 1, 1)
+            std = torch.as_tensor(
+                self.norm_stats[cam_name]["std"], dtype=torch.float32
+            ).view(-1, 1, 1)
+            obs = (obs - mean) / std
+        else:
+            warnings.warn(
+                f"No normalization stats for image key '{cam_name}', "
+                "using only /255 scaling. Please check if this is intended.",
+                UserWarning,
+                stacklevel=2,
+            )
+        return obs
+
     def get_device(self):
         """
         args_gpu:
@@ -125,6 +160,14 @@ class AlohaEvaluator:
         return device
 
     def _load_model(self) -> None:
+        # The saved config does NOT contain "camera_names": during training it is
+        # injected into the Policy config at runtime (ACTTrainer.initialize), AFTER the
+        # config file was copied to the log dir. Re-inject it here from img_keys (same
+        # order/rule as training) so the per-view cam_embed modules are rebuilt and the
+        # trained camera-view embeddings in the checkpoint are actually loaded instead
+        # of being silently dropped.
+        self.policy_config["camera_names"] = self.img_keys
+
         self.policy = ACTTrainer.get_policy(self.policy_config)
         self.action_dim = self.policy.config.get("action_dim")
         if self.action_dim is None:
@@ -271,7 +314,9 @@ class AlohaEvaluator:
                 all_available_img_keys = [i for i in obs.keys() if "image" in i]
                 image_list.append({k: obs[k] for k in all_available_img_keys})
 
-                # Prepare single frame proprioceptive state in (1, 1, state_dim)
+                # Prepare single frame proprioceptive state in (1, 1, state_dim).
+                # proprio_state is normalized with the same stats/formula as training
+                # (EpisodicDataset normalizes non-image observations identically).
                 proprio_state_np = np.array(obs["proprio_state"])
                 # (1, state_dim)
                 proprio_state_norm = self._pre_process(
@@ -289,7 +334,9 @@ class AlohaEvaluator:
                 # prepare single frame image in (1, num_cams, 1, C, H, W)
                 for i, cam_name in enumerate(self.img_keys):
                     curr_image = ts.observation[cam_name]  # numpy (H_i, W_i, C)
-                    curr_image = self.img_transform(curr_image)  # torch (C, H_i, W_i)
+                    curr_image = self._preprocess_image(
+                        curr_image, cam_name
+                    )  # torch (C, H_i, W_i)
                     curr_image = curr_image[
                         None, None
                     ]  # (1, 1, C, H_i, W_i)  batch=1, history=1
@@ -369,9 +416,7 @@ class AlohaEvaluator:
                 plt.ioff()
 
             rewards_arr = np.array(rewards)
-            episode_return = np.sum(rewards_arr) - len(
-                rewards
-            )  # subtract the negative step penalty to get actual return
+            episode_return = np.sum(rewards_arr)
             highest_reward = np.max(rewards_arr)
 
             episode_returns.append(episode_return)

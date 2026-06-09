@@ -15,7 +15,7 @@ from wrobo.training.lr_scheduler.ConstantLR import ConstantLRScheduler
 from wrobo.training.dataset.episodic_dataset import EpisodicDataset
 from wrobo.training.dataloader.sampler import InfiniteSampler
 from wrobo.training.dataloader.collater import BaseCollater
-from wrobo.utils.others import dummy_context
+from wrobo.training.utils.mics import is_main_process, dummy_context
 
 
 class ACTTrainer(DDPABCTrainer):
@@ -64,7 +64,7 @@ class ACTTrainer(DDPABCTrainer):
             "fold_" + self.fold,
         )
 
-        if self.is_main_process():
+        if is_main_process():
             os.makedirs(self.logs_output_folder, exist_ok=True)
             self.log_file = os.path.join(self.logs_output_folder, time_ + ".txt")
             with open(self.log_file, "w"):
@@ -80,7 +80,7 @@ class ACTTrainer(DDPABCTrainer):
         self.check_dataset_split()
         self.check_norm_stats()
 
-        if self.is_main_process():
+        if is_main_process():
             os.makedirs(config_and_code_save_path, exist_ok=True)
 
             self.print_to_log_file(
@@ -106,12 +106,12 @@ class ACTTrainer(DDPABCTrainer):
         if torch.cuda.is_bf16_supported():
             self.amp_dtype = torch.bfloat16
             self.grad_scaler = None  # BF16 don't need grad scaler
-            if self.is_main_process():
+            if is_main_process():
                 self.print_to_log_file("Using BF16 precision for training.")
         else:
             self.amp_dtype = torch.float16
             self.grad_scaler = GradScaler() if self.device.type == "cuda" else None
-            if self.is_main_process():
+            if is_main_process():
                 self.print_to_log_file(
                     "Using FP16 precision for training with GradScaler."
                 )
@@ -147,9 +147,17 @@ class ACTTrainer(DDPABCTrainer):
             self.setting_check()
 
             # build network
+            # derive camera view names from data_keys (same order/rule as the dataset's
+            # cam_keys) and bind them into the Policy config, so the model can attach a
+            # name-unique learnable embedding to each camera view.
+            self.config_dict["Policy"]["camera_names"] = [
+                key.replace("observations/", "")
+                for key in self.config_dict["Training_settings"]["data_keys"]
+                if "image" in key and "observations" in key
+            ]
             self.network = self.get_policy(self.config_dict["Policy"])
             if self.pretrained_weight is not None:
-                if self.is_main_process():
+                if is_main_process():
                     self.print_to_log_file(
                         f"Loading pretrained weight from {self.pretrained_weight}"
                     )
@@ -167,7 +175,7 @@ class ACTTrainer(DDPABCTrainer):
                 )
 
             if self.do_compile:
-                if self.is_main_process():
+                if is_main_process():
                     self.print_to_log_file("Compiling network...")
                     warnings.warn(
                         "⚠️ Find you use --do_compile during training, which can significantly speed up the training."

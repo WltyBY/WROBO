@@ -7,7 +7,7 @@ from wrobo.envs.Aloha.utils.sim_envs_ee import make_ee_sim_env
 
 
 def make_scripted_policy(task_name, inject_noise=False, random_seed=319):
-    if "sim_transfer_cube_stack" in task_name:
+    if "sim_transfer_stack_cube" in task_name:
         return StackTransferPolicy(inject_noise, random_seed)
     elif "sim_transfer_cube" in task_name:
         return PickAndTransferPolicy(inject_noise, random_seed)
@@ -603,9 +603,9 @@ def test_policy(task_name):
     inject_noise = False
 
     # setup the environment
-    if "sim_transfer_cube_stack" in task_name:
+    if "sim_transfer_stack_cube" in task_name:
         policy = StackTransferPolicy(inject_noise)
-        env = make_ee_sim_env("sim_transfer_cube_stack")
+        env = make_ee_sim_env("sim_transfer_stack_cube")
     elif "sim_transfer_cube" in task_name:
         policy = PickAndTransferPolicy(inject_noise)
         env = make_ee_sim_env("sim_transfer_cube")

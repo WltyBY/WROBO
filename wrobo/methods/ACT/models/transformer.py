@@ -377,6 +377,7 @@ class DETRVAE(nn.Module):
         backbone,
         backbone_PE,
         history_width,
+        camera_names=None,
         action_chunk_size=4,
         proprio_dim=14,
         env_dim=7,
@@ -427,6 +428,23 @@ class DETRVAE(nn.Module):
             self.time_embed.weight.requires_grad_(False)
             with torch.no_grad():
                 self.time_embed.weight.zero_()
+
+        # learnable camera-view embedding to distinguish different camera views.
+        # It is bound to the view *name* via an nn.ModuleDict, so each view's embedding
+        # is stored in the state_dict under a name-derived key (e.g. cam_embed.image_top
+        # .weight). The name->parameter binding therefore survives saving/loading and is
+        # independent of the order / number of views: reordering data_keys still matches
+        # by name, removing a view just drops its key, and adding a view creates a new
+        # independent key -- existing views always keep their own trained embedding.
+        self.camera_names = list(camera_names) if camera_names is not None else []
+        if len(self.camera_names) > 1:
+            # one (1, embed_dim) embedding per named view
+            self.cam_embed = nn.ModuleDict(
+                {name: nn.Embedding(1, embed_dim) for name in self.camera_names}
+            )
+        else:
+            # single (or unknown) camera: no view to disambiguate, so no embedding.
+            self.cam_embed = None
 
         # encoder extra parameters
         self.encoder_action_proj = nn.Linear(
@@ -485,7 +503,7 @@ class DETRVAE(nn.Module):
         proprio_state: batch, his_width, proprio_dim
         env_state: None or batch, history_width, env_dim (if backbone is None)
         actions: batch, seq, action_dim
-        """        
+        """
         if isinstance(image, list):
             num_cam = len(image)
             bs, his_width, *_ = image[0].shape
@@ -565,9 +583,7 @@ class DETRVAE(nn.Module):
                 # (bs, his_width, channel, height, width)
                 cam_imgs = image_list[cam_id]
                 # (bs*his_width, channel, height, width)
-                cam_imgs = cam_imgs.flatten(
-                    0, 1
-                )
+                cam_imgs = cam_imgs.flatten(0, 1)
 
                 features = self.backbone(cam_imgs)[
                     "4"
@@ -590,9 +606,18 @@ class DETRVAE(nn.Module):
                 # Time/History embedding
                 t_embed = self.time_embed.weight[:his_width][
                     None, :, :, None, None
-                ]  # (1, his_width, embed_dim)  # broadcast, (1, T, D, 1, 1)
+                ]  # (1, his_width, embed_dim, 1, 1)  # broadcast over bs and spatial
 
                 pos = pos + t_embed
+
+                # Camera-view embedding, bound to the view name (constant across
+                # time and spatial location, unique per view).
+                if self.cam_embed is not None:
+                    view_name = self.camera_names[cam_id]
+                    cam_e = self.cam_embed[view_name].weight[0][
+                        None, None, :, None, None
+                    ]  # (1, 1, embed_dim, 1, 1)  # broadcast over bs, time, spatial
+                    pos = pos + cam_e
 
                 all_cam_features.append(
                     features.flatten(3)

@@ -1,10 +1,8 @@
-import torchvision
-
 from torch import nn
 
 from wrobo.methods.ACT.models.backbone import ResNetBackBone
 from wrobo.methods.ACT.models.transformer import DETRVAE
-from wrobo.models.position_embedding import SinePositionEmbedding2D
+from wrobo.methods.ACT.models.position_embedding import SinePositionEmbedding2D
 
 
 class ACTPolicy(nn.Module):
@@ -50,6 +48,7 @@ class ACTPolicy(nn.Module):
     def get_model_settings(self):
         return {
             "history_width": self.config["history_width"],
+            "camera_names": self.config.get("camera_names", None),
             "action_chunk_size": self.config["action_chunk_size"],
             "proprio_dim": self.config["proprio_dim"],
             "env_dim": self.config["env_dim"],

@@ -36,16 +36,14 @@ def make_ee_sim_env(task_name, random_seed=319, max_timestep=None):
                                         right_gripper_qvel (1)]     # normalized gripper velocity (pos: opening, neg: closing)
                         "images": {"main": (480x640x3)}        # h, w, c, dtype='uint8'
     """
-    if "sim_transfer_cube_stack" in task_name:
+    if "sim_transfer_stack_cube" in task_name:
         xml_path = os.path.join(XML_DIR, "bimanual_viperx_ee_transfer_cube_stack.xml")
         physics = mujoco.Physics.from_xml_path(xml_path)
         task = TransferCubeStackEETask(random_seed=random_seed)
         env = control.Environment(
             physics,
             task,
-            time_limit=(
-                task.episode_len * DT if max_timestep is None else max_timestep
-            ),  # longer time limit for stacking
+            time_limit=(task.max_timesteps if max_timestep is None else max_timestep) * DT,
             control_timestep=DT,
             n_sub_steps=None,
             flat_observation=False,
@@ -57,7 +55,7 @@ def make_ee_sim_env(task_name, random_seed=319, max_timestep=None):
         env = control.Environment(
             physics,
             task,
-            time_limit=task.episode_len * DT if max_timestep is None else max_timestep,
+            time_limit=(task.max_timesteps if max_timestep is None else max_timestep) * DT,
             control_timestep=DT,
             n_sub_steps=None,
             flat_observation=False,
@@ -69,7 +67,7 @@ def make_ee_sim_env(task_name, random_seed=319, max_timestep=None):
         env = control.Environment(
             physics,
             task,
-            time_limit=task.episode_len * DT if max_timestep is None else max_timestep,
+            time_limit=(task.max_timesteps if max_timestep is None else max_timestep) * DT,
             control_timestep=DT,
             n_sub_steps=None,
             flat_observation=False,
@@ -82,6 +80,7 @@ def make_ee_sim_env(task_name, random_seed=319, max_timestep=None):
 class BimanualViperXEETask(base.Task):
     def __init__(self, random_seed=None):
         super().__init__(random=random_seed)
+        self.max_timesteps=None
 
     def before_step(self, action, physics):
         a_len = len(action) // 2
@@ -205,7 +204,7 @@ class TransferCubeEETask(BimanualViperXEETask):
     def __init__(self, random_seed=None):
         super().__init__(random_seed=random_seed)
         self.max_reward = 4
-        self.episode_len = 400
+        self.max_timesteps = 400
 
     def initialize_episode(self, physics):
         """Sets the state of the environment at the start of each episode."""
@@ -271,7 +270,7 @@ class InsertionEETask(BimanualViperXEETask):
     def __init__(self, random_seed=None):
         super().__init__(random_seed=random_seed)
         self.max_reward = 4
-        self.episode_len = 400
+        self.max_timesteps = 400
 
     def initialize_episode(self, physics):
         """Sets the state of the environment at the start of each episode."""
@@ -392,7 +391,7 @@ class TransferCubeStackEETask(BimanualViperXEETask):
     def __init__(self, random_seed=None):
         super().__init__(random_seed=random_seed)
         self.max_reward = 9
-        self.episode_len = 2400
+        self.max_timesteps = 2400
         self.color_order = ["red", "green", "blue"]
         self.current_color_idx = 0
         self.stacked_count = 0
