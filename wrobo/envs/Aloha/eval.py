@@ -405,9 +405,24 @@ class AlohaEvaluator:
                 target_qpos_list.append(action)
                 rewards.append(ts.reward)
 
+                # A rollout ends for one of two orthogonal reasons: task success
+                # (reward hits env_max_reward) or the env's time limit being reached
+                # (ts.last()). These mean different things, so check both. The success
+                # check lets us stop early and record the true step count; the last()
+                # check is a defensive guard so we never step past the env time_limit
+                # and trigger dm_control's auto-reset (which returns a FIRST timestep
+                # with reward=None and would poison the reward bookkeeping below). This
+                # no longer relies on range(max_timesteps) staying aligned with the env
+                # time_limit.
                 if ts.reward is not None and ts.reward == self.env_max_reward:
                     self.print_to_log_file(
                         f"Rollout {rollout_id:3d}: Max reward reached at step {t}/{self.max_timesteps}, ending rollout."
+                    )
+                    break
+
+                if ts.last():
+                    self.print_to_log_file(
+                        f"Rollout {rollout_id:3d}: Reached env time limit at step {t}/{self.max_timesteps}, ending rollout."
                     )
                     break
 
