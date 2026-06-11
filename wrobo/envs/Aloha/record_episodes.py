@@ -1,3 +1,6 @@
+# Copyright (c) 2023 Tony Z. Zhao
+# Modifications by [Litingyu Wang] on [2026]: [New Task sim_transfer_stack_cube]
+
 import argparse
 import time
 import os

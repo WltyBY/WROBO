@@ -188,7 +188,7 @@ class AlohaEvaluator:
         self.env = make_sim_env(self.task_name, self.random_seed, self.max_timesteps)
         self.env_max_reward = self.env.task.max_reward
         if self.max_timesteps is None:
-            self.max_timesteps = self.env.task.episode_len
+            self.max_timesteps = self.env.task.max_timesteps
 
     def _pre_process(self, data: np.ndarray, key: str) -> np.ndarray:
         mean = np.asarray(self.norm_stats[key]["mean"])

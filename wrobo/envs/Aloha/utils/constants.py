@@ -1,3 +1,5 @@
+# Copyright (c) 2023 Tony Z. Zhao
+
 import pathlib
 
 ### Task parameters
