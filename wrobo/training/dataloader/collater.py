@@ -6,6 +6,12 @@ class BaseCollater:
     Collate function for EpisodicDataset.
     Stacks all tensor keys along a new batch dimension.
     Non-tensor values (if any) are kept as lists.
+
+    Now handles flat dictionary format where each camera is a separate key.
+    Example input batch:
+        [{"image_angle": tensor, "image_wrist": tensor, "proprio_state": tensor}, ...]
+    Example output:
+        {"image_angle": stacked_tensor, "image_wrist": stacked_tensor, "proprio_state": stacked_tensor}
     """
     def __call__(self, batch: List[Dict[str, Any]]) -> Dict[str, Any]:
         collated = {}
@@ -15,10 +21,4 @@ class BaseCollater:
                 collated[key] = torch.stack(values)
             else:
                 collated[key] = values
-        
-        img_lst = []
-        num_cam = len(batch[0]["image"])
-        for i in range(num_cam):
-             img_lst.append(torch.stack([b["image"][i] for b in batch], dim=0))
-        collated["image"] = img_lst
         return collated

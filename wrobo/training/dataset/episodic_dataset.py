@@ -5,12 +5,20 @@ import warnings
 
 import numpy as np
 
-from typing import List, Dict
+from typing import List, Dict, Union
 from collections import OrderedDict
 from torch.utils.data import Dataset
 
-from wrobo.utils.file_operations import open_json
-from wrobo.utils.image_codec import get_encoding, decode_frames, RAW
+from wrobo.utils.image_codec import get_encoding, decode_frames, is_encoded
+from wrobo.utils.normalization import normalization_parameters
+from wrobo.training.dataset.instruction import INSTRUCTION_ATTR, build_instruction_provider, normalize_instruction_modes
+from wrobo.training.dataset.selection import _validated_task_ids, resolve_episode_ids
+from wrobo.training.dataset.sampling import (
+    SamplingMode,
+    normalize_biased_samples,
+    normalize_uniform_sample_probs,
+    sample_timestep,
+)
 
 
 class EpisodicDataset(Dataset):
@@ -27,30 +35,90 @@ class EpisodicDataset(Dataset):
     └── ... (other datasets, e.g. "ee_pos_abs", "ee_pos_rel", "rewards", etc.)
 
     data_keys: e.g. ["observations/image_wrist", "observations/image_top", "observations/proprio_state", "action_abs", ...]
+
+    Multi-dataset support:
+    - dataset_dir can be a single string (single dataset) or a list of strings (multiple datasets)
+    - When using multiple datasets, each dataset must have its own dataset_split.json
+    - Episode IDs are automatically prefixed with dataset index to avoid collisions
+    - biased_sample can be a shared mode or a list of modes in dataset_dir order
+    - uniform_sample_prob mixes uniform draws into early/late sampling per item
+    - task_ids selects complete trajectories independently for each dataset
+    - normalization_mode chooses standard mean/std or quantile center/half-width
+    - norm_stats can be:
+      * Unified dict (same stats for all datasets)
+      * Per-dataset dict: {dataset_dir: {key: {mean, std}}}
     """
 
     def __init__(
         self,
-        dataset_dir: str,
+        dataset_dir: Union[str, List[str]],
         split: str,
         fold: str,
         data_keys: List,
         history_width: int,
         action_chunk_size: int,
-        norm_stats: Dict,
+        norm_stats: Union[Dict, Dict[str, Dict]],
         img_transforms=None,
-        biased_sample: bool = False,
+        text_transform=None,
+        biased_sample: Union[SamplingMode, List[SamplingMode]] = "uniform",
+        instruction_mode=None,
+        uniform_sample_prob: Union[float, List[float]] = 0.0,
+        task_ids=None,
+        normalization_mode="standard",
     ):
         super(EpisodicDataset).__init__()
-        self.dataset_dir = dataset_dir
+        self._h5_cache = OrderedDict()
+
+        # Normalize dataset_dir to always be a list
+        if isinstance(dataset_dir, str):
+            self.dataset_dirs = [dataset_dir]
+        elif isinstance(dataset_dir, list):
+            self.dataset_dirs = dataset_dir
+        else:
+            raise TypeError(
+                f"dataset_dir must be str or list of str, got {type(dataset_dir)}"
+            )
+
+        self.is_multi_dataset = len(self.dataset_dirs) > 1
+
+        self.dataset_dir = self.dataset_dirs[0] if len(self.dataset_dirs) == 1 else self.dataset_dirs
+
+        if task_ids is None:
+            self.task_ids = [None] * len(self.dataset_dirs)
+        elif not isinstance(task_ids, list) or len(task_ids) != len(self.dataset_dirs):
+            raise ValueError("task_ids must contain one selection per dataset_dir")
+        else:
+            self.task_ids = [_validated_task_ids(selection) for selection in task_ids]
+        if normalization_mode not in ("standard", "quantile"):
+            raise ValueError("normalization_mode must be 'standard' or 'quantile'")
+        self.normalization_mode = normalization_mode
+
         self.split = split
         self.fold = fold
         self.data_keys = data_keys
         self.history_width = history_width
         self.action_chunk_size = action_chunk_size
+
+        self.per_dataset_norm_stats = isinstance(norm_stats, dict) and any(
+            directory in norm_stats for directory in self.dataset_dirs
+        )
+        if self.per_dataset_norm_stats:
+            missing = [directory for directory in self.dataset_dirs if directory not in norm_stats]
+            if missing:
+                raise ValueError(f"Normalization statistics are missing dataset groups: {missing}")
+            self.norm_stats_dict = {directory: norm_stats[directory] for directory in self.dataset_dirs}
+        else:
+            self.norm_stats_dict = {d: norm_stats for d in self.dataset_dirs}
+
         self.norm_stats = norm_stats
         self.img_transforms = img_transforms
+        self.text_transform = text_transform
         self.biased_sample = biased_sample
+        self.biased_samples = normalize_biased_samples(biased_sample, len(self.dataset_dirs))
+        self.uniform_sample_prob = uniform_sample_prob
+        self.uniform_sample_probs = normalize_uniform_sample_probs(
+            uniform_sample_prob, len(self.dataset_dirs)
+        )
 
         self.cam_keys = [
             key.replace("observations/", "")
@@ -58,10 +126,38 @@ class EpisodicDataset(Dataset):
             if "image" in key and "observations" in key
         ]
 
-        self.episode_ids = self._get_episode_ids()
-        self._h5_cache = OrderedDict()
-        self._h5_cache_size = min(len(self), 256)
-        self._h5_rdcc_nbytes = 1024**2 * 64  # 64MB cache for each file
+        # Optional language-instruction channel. Each enabled dataset must provide a
+        # unified instruction_library.json and string-valued episode metadata.
+        self.use_instruction = "instruction" in data_keys
+        self.instruction_modes = (
+            normalize_instruction_modes(instruction_mode, len(self.dataset_dirs))
+            if self.use_instruction else None
+        )
+        # Build instruction providers for each dataset directory
+        if self.use_instruction:
+            self.instruction_providers = {
+                dataset_dir: build_instruction_provider(dataset_dir)
+                for dataset_dir in self.dataset_dirs
+            }
+        else:
+            self.instruction_providers = None
+
+        # When language is consumed, a tokenizer is mandatory: the dataset's job is to
+        # yield model-ready tensors (the text-side analog of img_transforms turning raw
+        # frames into normalized tensors), so it must not leak a raw string. Methods
+        # that don't request "instruction" are unaffected (text_transform stays None).
+        if self.use_instruction and self.text_transform is None:
+            raise ValueError(
+                "'instruction' is in data_keys but no text_transform (tokenizer) was "
+                "provided. Pass a tokenizer so the dataset can return token ids."
+            )
+
+        # Build episode ID mapping: {episode_id: dataset_dir}
+        self.episode_ids, self.episode_to_dataset = self._get_episode_ids()
+        # Optimize cache size for better memory usage
+        # For 64GB machine with batch_size=8: use smaller cache to reduce memory footprint
+        self._h5_cache_size = min(len(self), 64)  # Reduced from 256 to 64
+        self._h5_rdcc_nbytes = 1024**2 * 16  # Reduced from 32MB to 16MB per file
 
     def __len__(self):
         return len(self.episode_ids)
@@ -73,23 +169,44 @@ class EpisodicDataset(Dataset):
         and [action_chunk_size, D] for actions. If the episode is shorter than history_width or action_chunk_size, it will be padded with zeros.
         """
         episode_id = self.episode_ids[idx]
-        episode_path = os.path.join(self.dataset_dir, f"{episode_id}.hdf5")
+        dataset_dir = self.episode_to_dataset[episode_id]
+        dataset_idx = (
+            int(episode_id.split("_", 1)[0][len("dataset"):])
+            if self.is_multi_dataset else 0
+        )
+
+        # Get the appropriate norm_stats for this episode's dataset
+        current_norm_stats = self.norm_stats_dict[dataset_dir]
+
+        # For multi-dataset, strip the prefix to get the actual episode filename
+        if self.is_multi_dataset:
+            # episode_id format: "dataset{i}_episode_xxx"
+            # Extract the actual episode name after the prefix
+            actual_episode_id = "_".join(episode_id.split("_")[1:])
+        else:
+            actual_episode_id = episode_id
+
+        # Episodes are in episodes/ subdirectory
+        episode_path = os.path.join(dataset_dir, "episodes", f"{actual_episode_id}.hdf5")
 
         data_dict = dict()
         root = self._get_h5_file(episode_path)
         episode_len = root.attrs["seq_len"]
 
-        # sample a timestep
-        if self.biased_sample:
-            # bias towards sampling later timesteps, which have more future and complex actions.
-            # u in [0, 1] -> map to [0, episode_len-1] to match the uniform branch's range
-            # (randint(episode_len) covers [0, L-1]); min() guards the u==1.0 edge.
-            u = np.random.beta(a=2.0, b=1.0)
-            sample_ts = min(int(u * episode_len), episode_len - 1)
-        else:
-            sample_ts = np.random.randint(episode_len)
+        # Select the distribution independently each time this item is sampled.
+        sample_ts = sample_timestep(
+            episode_len,
+            self.biased_samples[dataset_idx],
+            self.uniform_sample_probs[dataset_idx],
+        )
 
         for key in self.data_keys:
+            # The language instruction is not an hdf5 dataset; it is produced by the
+            # instruction provider after this tensor loop. Skip it here so the existing
+            # observation/action handling stays untouched.
+            if key == "instruction":
+                continue
+
             # assert (
             #     "/" + key in root
             # ), f"Key {key} not found in episode file {episode_path}, available keys: {[k for k in root.keys()]}"
@@ -98,7 +215,9 @@ class EpisodicDataset(Dataset):
                 obs_seq = root["/" + key]
                 # image datasets may be stored as per-frame encoded byte strings;
                 # capture the encoding now (slicing returns a plain array w/o attrs).
-                img_encoding = get_encoding(obs_seq) if "image" in key else RAW
+                img_is_encoded = (
+                    is_encoded(get_encoding(obs_seq)) if "image" in key else False
+                )
 
                 start_idx = sample_ts - self.history_width + 1
                 end_idx = sample_ts + 1
@@ -124,7 +243,7 @@ class EpisodicDataset(Dataset):
                     # uint8 array if the dataset is encoded (png/jpg); "raw" is already
                     # a dense array. Padding above operated on the (object) byte strings,
                     # which is fine since np.repeat/concatenate just duplicate elements.
-                    if img_encoding != RAW:
+                    if img_is_encoded:
                         obs_chunk = decode_frames(obs_chunk)
 
                     # For image
@@ -140,14 +259,11 @@ class EpisodicDataset(Dataset):
                         # get_norm_stats), mirroring ToTensor + Normalize.
                         obs = obs.float() / 255.0  # (his_width, C, H, W)
                         norm_key = key.replace("observations/", "")
-                        if norm_key in self.norm_stats:
+                        if norm_key in current_norm_stats:
                             # stats are per-channel (C,); broadcast over H, W
-                            mean = torch.as_tensor(
-                                self.norm_stats[norm_key]["mean"], dtype=torch.float32
-                            ).view(1, -1, 1, 1)
-                            std = torch.as_tensor(
-                                self.norm_stats[norm_key]["std"], dtype=torch.float32
-                            ).view(1, -1, 1, 1)
+                            mean, std = normalization_parameters(current_norm_stats[norm_key], "standard")
+                            mean = torch.as_tensor(mean, dtype=torch.float32).view(1, -1, 1, 1)
+                            std = torch.as_tensor(std, dtype=torch.float32).view(1, -1, 1, 1)
                             obs = (obs - mean) / std
                         else:
                             warnings.warn(
@@ -157,15 +273,12 @@ class EpisodicDataset(Dataset):
                                 stacklevel=2,
                             )
                 else:
-                    # Non-image observations (e.g. proprio_state, proprio_vel) are
-                    # normalized with the same stats/formula used at inference time
-                    # (AlohaEvaluator._pre_process): (x - mean) / std. std is already
-                    # floored (>=1e-8) in get_norm_stats, so no extra epsilon is needed.
+                    # Numeric observations use the model's explicit normalization mode.
                     norm_key = key.replace("observations/", "")
                     obs_chunk = np.asarray(obs_chunk, dtype=np.float32)
-                    if norm_key in self.norm_stats:
-                        mean = np.asarray(self.norm_stats[norm_key]["mean"])
-                        std = np.asarray(self.norm_stats[norm_key]["std"])
+                    if norm_key in current_norm_stats:
+                        mean, std = normalization_parameters(current_norm_stats[norm_key], self.normalization_mode)
+                        mean, std = np.asarray(mean, dtype=np.float32), np.asarray(std, dtype=np.float32)
                         obs_chunk = (obs_chunk - mean) / std
                     else:
                         warnings.warn(
@@ -201,9 +314,9 @@ class EpisodicDataset(Dataset):
                         is_pad[action_len:] = 1  # 1 for padding steps, 0 for real data
 
                 # normalization for actions
-                if key in self.norm_stats:
-                    mean = np.asarray(self.norm_stats[key]["mean"])
-                    std = np.asarray(self.norm_stats[key]["std"])
+                if key in current_norm_stats:
+                    mean, std = normalization_parameters(current_norm_stats[key], self.normalization_mode)
+                    mean, std = np.asarray(mean, dtype=np.float32), np.asarray(std, dtype=np.float32)
                     padded_action = (padded_action - mean) / std
                 else:
                     warnings.warn(
@@ -217,34 +330,63 @@ class EpisodicDataset(Dataset):
                 if "is_pad" not in data_dict:
                     data_dict["is_pad"] = torch.from_numpy(is_pad).bool()
 
-        # generate "image" key for easier access in the model, which is a list of image tensors with shape [history_width, C, H, W]
-        if self.cam_keys:
-            data_dict["image"] = [data_dict[key] for key in self.cam_keys]
-            # we do not stack a new dimension for camera views, since different cameras may have different image sizes and channel numbers,
-            # and the model should be able to handle variable number of camera views. The model can access each camera view by data_dict["image"][i], which has shape [history_width, C, H, W].
-            for key in self.cam_keys:
-                del data_dict[key]
+        # Language instruction. The provider yields a raw string; the text_transform
+        # (tokenizer) turns it into model-ready token ids, mirroring how img_transforms
+        # turns raw frames into normalized tensors. Random selection augments language
+        # at train time; a stable per-episode choice keeps val/test reproducible while
+        # still varying wording across episodes.
+        if self.use_instruction:
+            provider = self.instruction_providers[dataset_dir]
+            if INSTRUCTION_ATTR not in root.attrs:
+                raise ValueError(
+                    f"Episode {actual_episode_id} has no '{INSTRUCTION_ATTR}' in metadata"
+                )
+            instruction_str = root.attrs[INSTRUCTION_ATTR]
+
+            channels = provider.get_channels(
+                instruction_str=instruction_str,
+                frame_idx=sample_ts,
+                mode=self.instruction_modes[dataset_idx],
+                episode_id=actual_episode_id,
+                pick_random=(self.split == "train"),
+            )
+            for channel, text in channels.items():
+                data_dict[f"instruction_{channel}"] = self.text_transform(text or "")
+                data_dict[f"instruction_{channel}_valid"] = torch.tensor(text is not None)
+            instruction = " ".join(text for text in channels.values() if text is not None)
+            data_dict["instruction"] = self.text_transform(instruction)
 
         return data_dict
 
     def _get_episode_ids(self):
-        split_file_path = os.path.join(self.dataset_dir, "dataset_split.json")
-        dataset_split = open_json(split_file_path)
-        if self.fold == "all":
-            if self.split in ["train", "val"]:
-                ids = dataset_split["0"]["train"] + dataset_split["0"]["val"]
-            elif self.split == "test":
-                ids = dataset_split[self.split]
+        """
+        Load episode IDs from all dataset directories.
+
+        Returns:
+            tuple: (episode_ids, episode_to_dataset)
+                - episode_ids: List of episode IDs (prefixed with dataset index for multi-dataset)
+                - episode_to_dataset: Dict mapping episode_id to its dataset directory
+        """
+        all_ids = []
+        episode_to_dataset = {}
+
+        for dataset_idx, dataset_dir in enumerate(self.dataset_dirs):
+            ids = resolve_episode_ids(dataset_dir, self.fold, self.split, self.task_ids[dataset_idx])
+
+            # Prefix episode IDs to avoid collisions across datasets
+            if self.is_multi_dataset:
+                prefix = f"dataset{dataset_idx}_"
+                prefixed_ids = [f"{prefix}{ep_id}" for ep_id in ids]
             else:
-                raise Exception('Para:split should be "train", "val" or "test".')
-        else:
-            if self.split in ["train", "val"]:
-                ids = dataset_split[self.fold][self.split]
-            elif self.split == "test":
-                ids = dataset_split[self.split]
-            else:
-                raise Exception('Para:split should be "train", "val" or "test".')
-        return ids
+                prefixed_ids = ids
+
+            # Build mapping
+            for prefixed_id in prefixed_ids:
+                episode_to_dataset[prefixed_id] = dataset_dir
+
+            all_ids.extend(prefixed_ids)
+
+        return all_ids, episode_to_dataset
 
     def _get_h5_file(self, path):
         if path in self._h5_cache:

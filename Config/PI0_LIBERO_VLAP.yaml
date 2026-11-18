@@ -1,0 +1,32 @@
+Policy:
+  pretrained_load_mode: full
+  pretrained_policy_path: lerobot/pi0_base
+  pretrained_revision: null
+  local_files_only: false
+
+  text_tokenizer_name: google/paligemma-3b-pt-224
+  tokenizer_max_length: 48
+
+  action_chunk_size: 50
+  proprio_dim: 8
+  action_dim: 7
+  num_inference_steps: 10
+
+  # OpenPI precision: BF16 with selected embeddings, norms and projections in FP32.
+  dtype: bfloat16
+  gradient_checkpointing: true
+  # Ordinary fine-tuning: train all action-related Vision, Language, Expert and Projection weights.
+  freeze_vision_encoder: False
+  freeze_language_encoder: False
+
+Training_settings:
+  # LIBERO OSC_POSE actions are already relative; do not use the SO101 action_abs mapping.
+  data_keys: [observations/image_top, observations/image_wrist, observations/proprio_ee, action_rel, instruction]
+  tr_iterations_per_epoch: 250
+  val_iterations_per_epoch: 50
+
+  # Full fine-tuning uses the official PI0 learning-rate baseline.
+  base_lr: 2.5e-5
+  min_lr: 2.5e-6
+  weight_decay: 0.01
+  grad_clip_norm: 1.0

@@ -1,212 +1,80 @@
-import os
+import numpy as np
 import torch
-import warnings
-
-from datetime import datetime
-from torch import GradScaler, optim, nn, autocast
+from torch import nn, optim
 from torchvision import transforms
-from torch.utils.data import DistributedSampler, RandomSampler, DataLoader
 
+from wrobo.methods.ACT.models.dimensions import resolve_act_dimensions
 from wrobo.methods.ACT.models.policy import ACTPolicy
-from wrobo.training.ABCTrainer import DDPABCTrainer
-from wrobo.utils.file_operations import copy_file_to_dstFolder, open_json
-from wrobo.utils.load_model_weights import load_pretrained_weights
 from wrobo.training.lr_scheduler.ConstantLR import ConstantLRScheduler
-from wrobo.training.dataset.episodic_dataset import EpisodicDataset
-from wrobo.training.dataloader.sampler import InfiniteSampler
-from wrobo.training.dataloader.collater import BaseCollater
-from wrobo.training.utils.mics import is_main_process, dummy_context
+from wrobo.training.trainer.ABCTrainer import DDPABCTrainer
+from wrobo.training.trainer.loss import LossTerm
+from wrobo.training.transforms.GammaTransform import GammaTransform
 
 
 class ACTTrainer(DDPABCTrainer):
-    def __init__(
-        self,
-        training_args,
-        verbose: bool = True,
-    ):
-        self.verbose = verbose
+    def get_hyperparameters_name(self):
+        return f"w_KL_{self.w_KL}"
 
-        self.save_every = 5
-        self.disable_checkpointing = False
-
-        self.get_default_training_args(training_args)
-        self.get_custom_training_args(training_args)
-
-        self.device = self.get_device()
-        self.sync_processes()
-
-        # Task-general params
-        task_general_names = "BS_{}_EPOCH_{}_SEED_{}_PRETRAINED_{}".format(
-            self.batch_size,
-            self.num_epoch,
-            self.random_seed,
-            self.pretrained_weight is not None,
+    def _validate_norm_stats(self):
+        """Check the configured numerical fields against ACT state/action dimensions."""
+        if not isinstance(self.norm_stats, dict):
+            raise ValueError("ACT norm_stats.json must contain a dictionary")
+        policy = self.config_dict["Policy"]
+        proprio_dim, action_dim = resolve_act_dimensions(
+            policy.get("proprio_dim"), policy.get("action_dim")
         )
-
-        # hyperparameter
-        hyperparams_name = f"w_KL_{self.w_KL}"
-
-        timestamp = datetime.now()
-        time_ = "Train_Log_%d_%d_%d_%02.0d_%02.0d_%02.0d" % (
-            timestamp.year,
-            timestamp.month,
-            timestamp.day,
-            timestamp.hour,
-            timestamp.minute,
-            timestamp.second,
-        )
-        assert self.method_name is not None
-        self.logs_output_folder = os.path.join(
-            self.log_dir,
-            self.method_name,
-            task_general_names,
-            hyperparams_name,
-            "fold_" + self.fold,
-        )
-
-        if is_main_process():
-            os.makedirs(self.logs_output_folder, exist_ok=True)
-            self.log_file = os.path.join(self.logs_output_folder, time_ + ".txt")
-            with open(self.log_file, "w"):
-                pass
+        directories = self.dataset_dir if isinstance(self.dataset_dir, list) else [self.dataset_dir]
+        per_dataset = any(directory in self.norm_stats for directory in directories)
+        if per_dataset:
+            missing_directories = [directory for directory in directories if directory not in self.norm_stats]
+            if missing_directories:
+                raise ValueError(f"ACT norm_stats.json is missing dataset groups: {missing_directories}")
+            groups = [(directory, self.norm_stats[directory]) for directory in directories]
         else:
-            self.log_file = None
-
-        config_and_code_save_path = os.path.join(
-            self.logs_output_folder, "Config_and_Trainer"
-        )
-        script_path = os.path.abspath(__file__)
-
-        self.check_dataset_split()
-        self.check_norm_stats()
-
-        if is_main_process():
-            os.makedirs(config_and_code_save_path, exist_ok=True)
-
-            self.print_to_log_file(
-                f"Using device: {self.device.type} | DDP: {self.is_ddp} | world_size: {self.world_size}"
-            )
-
-            # copy the config file to the logs folder
-            copy_file_to_dstFolder(self.config_file, config_and_code_save_path)
-
-            # copy the trainer file to the logs folder
-            copy_file_to_dstFolder(script_path, config_and_code_save_path)
-
-            # copy dataset_split file to the logs folder
-            copy_file_to_dstFolder(
-                os.path.join(self.dataset_dir, "dataset_split.json"),
-                config_and_code_save_path,
-            )
-
-            self.print_to_log_file(
-                "Training logs will be saved in:", self.logs_output_folder
-            )
-
-        if torch.cuda.is_bf16_supported():
-            self.amp_dtype = torch.bfloat16
-            self.grad_scaler = None  # BF16 don't need grad scaler
-            if is_main_process():
-                self.print_to_log_file("Using BF16 precision for training.")
-        else:
-            self.amp_dtype = torch.float16
-            self.grad_scaler = GradScaler() if self.device.type == "cuda" else None
-            if is_main_process():
-                self.print_to_log_file(
-                    "Using FP16 precision for training with GradScaler."
+            groups = [("merged", self.norm_stats)]
+        for group_name, stats in groups:
+            if not isinstance(stats, dict):
+                raise ValueError(f"ACT normalization group {group_name!r} must be a dictionary")
+            missing = [key for key in (self.proprio_key, self.action_key) if key not in stats]
+            if missing:
+                raise ValueError(
+                    f"ACT normalization group {group_name!r} is missing selected fields {missing}. "
+                    "Recompute norm_stats.json for the current data_keys or use a new log directory."
                 )
-
-        self.logger = self.get_logger()
-        self._best_ema = None
-        self.ema_decay = getattr(self, "ema_decay", 0.9)
-        self.norm_stats = open_json(
-            os.path.join(self.logs_output_folder, "norm_stats.json")
-        )
-        self.was_initialized = False
-        self.current_epoch = 0
-
-        if self.continue_train:
-            checkpoint = os.path.join(self.logs_output_folder, "checkpoint_latest.pth")
-            self.sync_processes()
-            if not os.path.isfile(checkpoint):
-                raise FileNotFoundError(
-                    f"Continue training was requested but checkpoint not found: {checkpoint}"
-                )
-            self.load_checkpoint(checkpoint)
-        self.sync_processes()
-
-    def initialize(self):
-        """
-        Initialize networks, optimizers, schedulers, loss, etc.
-        self.networks
-        self.optimizers
-        self.schedulers
-        """
-        if not self.was_initialized:
-            self.init_random()
-            self.setting_check()
-
-            # build network
-            # derive camera view names from data_keys (same order/rule as the dataset's
-            # cam_keys) and bind them into the Policy config, so the model can attach a
-            # name-unique learnable embedding to each camera view.
-            self.config_dict["Policy"]["camera_names"] = [
-                key.replace("observations/", "")
-                for key in self.config_dict["Training_settings"]["data_keys"]
-                if "image" in key and "observations" in key
-            ]
-            self.network = self.get_policy(self.config_dict["Policy"])
-            if self.pretrained_weight is not None:
-                if is_main_process():
-                    self.print_to_log_file(
-                        f"Loading pretrained weight from {self.pretrained_weight}"
+            for key, width, dimension_name in (
+                (self.proprio_key, proprio_dim, "proprio_dim"),
+                (self.action_key, action_dim, "action_dim"),
+            ):
+                entry = stats[key]
+                if not isinstance(entry, dict) or not {"mean", "std"} <= set(entry):
+                    raise ValueError(f"ACT normalization stats for {key!r} need mean and std")
+                try:
+                    mean = np.asarray(entry["mean"], dtype=np.float64)
+                    std = np.asarray(entry["std"], dtype=np.float64)
+                except (TypeError, ValueError) as error:
+                    raise ValueError(f"ACT normalization stats for {key!r} must be numeric") from error
+                if mean.ndim != 1 or std.shape != mean.shape:
+                    raise ValueError(f"ACT normalization stats for {key!r} must be matching 1-D mean/std vectors")
+                if not np.isfinite(mean).all() or not np.isfinite(std).all() or not (std > 0).all():
+                    raise ValueError(f"ACT normalization stats for {key!r} must be finite with positive std")
+                if mean.shape != (width,):
+                    raise ValueError(
+                        f"ACT normalization stats for selected field {key!r} have width {mean.size}, "
+                        f"but Policy.{dimension_name}={width} requires width {width}. "
+                        "Check the selected data key, configuration and normalization statistics."
                     )
-                load_pretrained_weights(self.network, self.pretrained_weight)
 
-            self.network.to(self.device)
-
-            if self.is_ddp:
-                self.network = self.convert_bn2syncbn(self.network)
-                self.network = torch.nn.parallel.DistributedDataParallel(
-                    self.network,
-                    device_ids=[self.device.index],
-                    output_device=self.device.index,
-                    find_unused_parameters=not self.do_compile,
-                )
-
-            if self.do_compile:
-                if is_main_process():
-                    self.print_to_log_file("Compiling network...")
-                    warnings.warn(
-                        "⚠️ Find you use --do_compile during training, which can significantly speed up the training."
-                        "However, I found NaN during training while debugging with torch.compile, which may be due to some unstable operators in the model. "
-                        "If you also encounter NaN during training, consider don't use --do_compile or try to find out which operator causes the instability and avoid using it. ",
-                        RuntimeWarning,
-                    )
-                self.network = torch.compile(self.network)
-                torch.compiler.reset()
-
-            self.optimizer, self.lr_scheduler = self.get_optimizers()
-
-            # initialize loss
-            self.L1_loss = nn.L1Loss(reduction="none")
-
-            if self.do_deep_supervision:
-                self.L1_loss = self._build_deep_supervision_loss_object(
-                    self.L1_loss,
-                    self.config_dict["Policy"].get("num_decoder_layers", 1),
-                )
-
-            self.was_initialized = True
-        else:
-            raise RuntimeError(
-                "self.initialize() should only be called once. "
-                "Or initialization was done before initialize method???"
+    def initialize_loss(self):
+        self.L1_loss = nn.L1Loss(reduction="none")
+        if self.do_deep_supervision:
+            self.L1_loss = self._build_deep_supervision_loss_object(
+                self.L1_loss,
+                self.config_dict["Policy"].get("num_decoder_layers", 1),
             )
 
     def get_optimizers(self):
         optimizer = optim.AdamW(
-            self.network.parameters(),
+            (parameter for parameter in self.policy.parameters() if parameter.requires_grad),
             lr=self.config_dict["Training_settings"]["base_lr"],
             weight_decay=self.config_dict["Training_settings"]["weight_decay"],
         )
@@ -220,6 +88,38 @@ class ACTTrainer(DDPABCTrainer):
     def get_policy(policy_config):
         return ACTPolicy(policy_config)
 
+    # ------------------------------------------------------------------ #
+    # Eval hooks: let a method-agnostic evaluator build & drive this      #
+    # method's policy (model is reconstructed by whatever method trained  #
+    # it). See wrobo/sim_envs/Aloha/eval.py.                              #
+    # ------------------------------------------------------------------ #
+    @classmethod
+    def build_policy(cls, policy_config, log_dir=None, *, artifact_dir=None):
+        """Construct the policy exactly as training does, and return (policy, aux).
+
+        ACT injects camera_names into the config at train time (after the config was
+        copied), so re-inject from data_keys here. ACT has no language, so aux is None.
+        """
+        # camera_names are derived from the image observation keys, same rule as the
+        # dataset/cam_keys, so the per-view embeddings are rebuilt and loaded correctly.
+        policy_config = dict(policy_config)
+        policy_config["camera_names"] = policy_config.get("camera_names") or []
+        # Evaluation loads the complete trained checkpoint, so backbone weights
+        # need not be fetched again. Preserve their name for the BN architecture.
+        policy_config.setdefault("backbone_load_pretrained", False)
+        return cls.get_policy(policy_config), None
+
+    @staticmethod
+    def build_policy_inputs(obs, aux, device):
+        images = {k: v.to(device) for k, v in obs["image"].items()}
+        camera_names = list(obs["image"].keys())
+
+        return {
+            "image": images,
+            "camera_names": camera_names,
+            "proprio_state": obs["state"].to(device),
+        }
+
     def get_training_img_transforms(self):
         """
         Get training transforms for images.
@@ -229,19 +129,10 @@ class ACTTrainer(DDPABCTrainer):
         return transforms.Compose(
             [
                 transforms.ToPILImage(),
-                # transforms.Resize(256),
-                # transforms.RandomCrop(224),
-                # transforms.RandomHorizontalFlip(p=0.5),
-                # transforms.RandomApply(
-                #     transforms.ColorJitter(
-                #         brightness=0.4, contrast=0.4, saturation=0.4, hue=0.1
-                #     ),
-                #     p=0.8,
-                # ),
-                # transforms.RandomGrayscale(p=0.2),
-                # transforms.RandomApply(
-                #     [transforms.GaussianBlur(kernel_size=3, sigma=(0.1, 2.0))], p=0.3
-                # ),
+                transforms.RandomApply([GammaTransform(gamma_range=(0.7, 1.3))], p=0.5),
+                transforms.RandomApply(
+                    [transforms.GaussianBlur(kernel_size=3, sigma=(0.1, 0.8))], p=0.2
+                ),
                 transforms.ToTensor(),
                 transforms.Normalize(
                     mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]
@@ -255,11 +146,14 @@ class ACTTrainer(DDPABCTrainer):
 
         Accept Tensor with a shape of [C, H, W]
         """
+        return self.get_eval_img_transform()
+
+    @staticmethod
+    def get_eval_img_transform():
+        """Return the deterministic image transform shared by validation/deployment."""
         return transforms.Compose(
             [
                 transforms.ToPILImage(),
-                # transforms.Resize(256),
-                # transforms.RandomCrop(224),
                 transforms.ToTensor(),
                 transforms.Normalize(
                     mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]
@@ -267,121 +161,16 @@ class ACTTrainer(DDPABCTrainer):
             ]
         )
 
-    def get_train_and_val_dataset(self):
-        """
-        Get training and validation dataset.
-        """
-        train_dataset = EpisodicDataset(
-            dataset_dir=self.dataset_dir,
-            split="train",
-            fold=self.fold,
-            data_keys=self.config_dict["Training_settings"]["data_keys"],
-            history_width=self.config_dict["Policy"]["history_width"],
-            action_chunk_size=self.config_dict["Policy"]["action_chunk_size"],
-            norm_stats=self.norm_stats,
-            img_transforms=self.get_training_img_transforms(),
-            biased_sample=self.config_dict["Training_settings"]["biased_sample"],
-        )
-        val_dataset = EpisodicDataset(
-            dataset_dir=self.dataset_dir,
-            split="val",
-            fold=self.fold,
-            data_keys=self.config_dict["Training_settings"]["data_keys"],
-            history_width=self.config_dict["Policy"]["history_width"],
-            action_chunk_size=self.config_dict["Policy"]["action_chunk_size"],
-            norm_stats=self.norm_stats,
-            img_transforms=self.get_validation_img_transforms(),
-            biased_sample=self.config_dict["Training_settings"]["biased_sample"],
-        )
-        return train_dataset, val_dataset
+    def prepare_inputs(self, batch):
+        return super().prepare_inputs(batch)[:5]
 
-    def build_sampler(self, dataset):
-        """
-        If DDP is used, make sure to use DistributedSampler to partition the dataset.
-        """
-        if self.is_ddp:
-            base_sampler = DistributedSampler(
-                dataset,
-                num_replicas=self.world_size,
-                rank=self.rank,
-                shuffle=True,
-                seed=self.random_seed,
-                drop_last=True,
-            )
-        else:
-            base_sampler = RandomSampler(dataset)
-        return InfiniteSampler(base_sampler)
+    def compute_training_loss(self, batch):
+        images, camera_names, proprio_states, actions, is_pad = self.prepare_inputs(batch)
 
-    def get_train_and_val_dataloader(self):
-        """
-        Get training and validation dataloader.
-        """
-        train_dataset, val_dataset = self.get_train_and_val_dataset()
-
-        train_sampler = self.build_sampler(train_dataset)
-        # shuffle is True here, because we expect patch based validation to be more comprehensive.
-        # If the number of validation iteration is smaller than the valset, the validation
-        # throughout the entire training process cannot cover all the images in the val set.
-        val_sampler = self.build_sampler(val_dataset)
-
-        this_num_workers = max(1, self.num_workers // self.world_size)
-        assert (
-            self.batch_size % self.world_size == 0
-        ), f"Batch size {self.batch_size} should be divisible by world size {self.world_size} for distributed training."
-        this_batch_size = self.batch_size // self.world_size
-
-        train_loader = DataLoader(
-            train_dataset,
-            batch_size=this_batch_size,
-            sampler=train_sampler,
-            shuffle=False,
-            num_workers=this_num_workers,
-            collate_fn=BaseCollater(),
-            pin_memory=self.device.type == "cuda",
-            persistent_workers=True,
-            worker_init_fn=self.worker_init_fn,
-            drop_last=True,
-            prefetch_factor=2,
-        )
-
-        val_loader = DataLoader(
-            val_dataset,
-            batch_size=this_batch_size,
-            sampler=val_sampler,
-            shuffle=False,
-            num_workers=this_num_workers,
-            collate_fn=BaseCollater(),
-            pin_memory=self.device.type == "cuda",
-            persistent_workers=True,
-            drop_last=True,
-            prefetch_factor=2,
-        )
-
-        return train_loader, val_loader
-
-    def train_step(self, batch):
-        images = batch["image"]
-        proprio_states = batch["proprio_state"]
-        actions = batch["action_abs"]
-        is_pad = batch["is_pad"]
-
-        # to device
-        if isinstance(images, list):
-            images = [img.to(self.device, non_blocking=True) for img in images]
-        else:
-            images = images.to(self.device, non_blocking=True)
-        proprio_states = proprio_states.to(self.device, non_blocking=True)
-        actions = actions.to(self.device, non_blocking=True)
-        is_pad = is_pad.to(self.device, non_blocking=True)
-
-        self.optimizer.zero_grad(set_to_none=True)
-        with (
-            autocast(self.device.type, dtype=self.amp_dtype, enabled=True)
-            if self.device.type == "cuda"
-            else dummy_context()
-        ):
-            outputs = self.network(
+        with self.autocast_context():
+            outputs = self.policy(
                 image=images,
+                camera_names=camera_names,
                 proprio_state=proprio_states,
                 actions=actions,
                 is_pad=is_pad,
@@ -391,80 +180,15 @@ class ACTTrainer(DDPABCTrainer):
                 actions = [actions] * len(outputs["action_chunk"])
 
             # Compute Loss
-            l1_ = (
-                self.L1_loss(outputs["action_chunk"], actions) * ~is_pad.unsqueeze(-1)
-            ).mean()
+            l1_per_elem = self.L1_loss(outputs["action_chunk"], actions)
+            l1_ = self.masked_action_loss(l1_per_elem, is_pad)
 
             mu: torch.Tensor = outputs["mu"]
             logvar: torch.Tensor = outputs["logvar"]
             # mean over batch, sum over dimensions
             kl_ = -0.5 * (1 + logvar - mu.pow(2) - logvar.exp()).sum(dim=1).mean(dim=0)
 
-            # assert not (torch.isnan(l1_) or torch.isnan(kl_)), f"L1: {l1_}. KL: {kl_}"
-            l = l1_ + self.w_KL * kl_
-
-        if self.grad_scaler is not None:
-            self.grad_scaler.scale(l).backward()
-            self.grad_scaler.unscale_(self.optimizer)
-            torch.nn.utils.clip_grad_norm_(self.network.parameters(), 1.0)
-            self.grad_scaler.step(self.optimizer)
-            self.grad_scaler.update()
-        else:
-            l.backward()
-            torch.nn.utils.clip_grad_norm_(self.network.parameters(), 1.0)
-            self.optimizer.step()
-
         return {
-            "loss": l.detach().cpu().numpy(),
-            "L1_loss": l1_.detach().cpu().numpy(),
-            "KL_loss": kl_.detach().cpu().numpy(),
-        }
-
-    @torch.inference_mode()
-    def validation_step(self, batch):
-        images = batch["image"]
-        proprio_states = batch["proprio_state"]
-        actions = batch["action_abs"]
-        is_pad = batch["is_pad"]
-
-        # to device
-        if isinstance(images, list):
-            images = [img.to(self.device, non_blocking=True) for img in images]
-        else:
-            images = images.to(self.device, non_blocking=True)
-        proprio_states = proprio_states.to(self.device, non_blocking=True)
-        actions = actions.to(self.device, non_blocking=True)
-        is_pad = is_pad.to(self.device, non_blocking=True)
-
-        with (
-            autocast(self.device.type, dtype=self.amp_dtype, enabled=True)
-            if self.device.type == "cuda"
-            else dummy_context()
-        ):
-            outputs = self.network(
-                image=images,
-                proprio_state=proprio_states,
-                actions=actions,
-                is_pad=is_pad,
-            )
-
-            if self.do_deep_supervision:
-                actions = [actions] * len(outputs["action_chunk"])
-
-            # Compute Loss
-            l1_ = (
-                self.L1_loss(outputs["action_chunk"], actions) * ~is_pad.unsqueeze(-1)
-            ).mean()
-
-            mu: torch.Tensor = outputs["mu"]
-            logvar: torch.Tensor = outputs["logvar"]
-            # mean over batch, sum over dimensions
-            kl_ = -0.5 * (1 + logvar - mu.pow(2) - logvar.exp()).sum(dim=1).mean(dim=0)
-
-            l = l1_ + self.w_KL * kl_
-
-        return {
-            "loss": l.detach().cpu().numpy(),
-            "L1_loss": l1_.detach().cpu().numpy(),
-            "KL_loss": kl_.detach().cpu().numpy(),
+            "L1_loss": LossTerm(l1_),
+            "KL_loss": LossTerm(kl_, normalization="samples", weight=self.w_KL),
         }

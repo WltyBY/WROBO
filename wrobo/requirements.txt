@@ -1,17 +1,75 @@
-transformers==5.0.0rc0
-h5py
-pyyaml
-opencv-python
+# Install from the workspace root:
+#   python -m pip install -r wrobo/requirements.txt
+# LeRobot requires Python >=3.12; no local LeRobot source checkout is needed.
+
+# Core training and data processing
+torch<=2.11.0
+torchvision>=0.19.0
+transformers>=5.4.0,<5.6.0
 numpy
+h5py
+PyYAML
 tqdm
-opencv-python
-torch==2.11
-torchvision
 tensorboard
-mujoco==2.3.7
-dm_control==1.0.14
-pyquaternion
+# GUI OpenCV provides live camera debugging through setup cameras --debug.
+# LeRobot declares headless as a dependency: after installing this file, remove
+# headless and reinstall the GUI wheel as documented in hardware_setup.md.
+opencv-python>=4.9.0,<4.14.0
+Pillow
 matplotlib
-tensorflow-datasets
+
+# Checkpoints and Hugging Face integrations
+huggingface-hub>=1.6.0,<2.0.0
+safetensors>=0.4.3
+peft>=0.18.0,<1.0.0
+sentencepiece>=0.2.0
+num2words
+
+# Dataset conversion and video I/O
+pyarrow
+av
 imageio>=2.31.0
-deepspeed>=0.18.3
+
+# Motus / WAN
+# deepspeed>=0.18.3
+# diffusers
+# einops
+# easydict
+# ftfy
+# regex
+# scipy
+# requests
+# packaging
+# dashscope
+# decord
+
+# Optional CUDA acceleration for Motus/WAN. Install separately after PyTorch:
+#   pip install flash-attn --no-build-isolation
+
+# ALOHA simulation
+mujoco>=2.3.7
+dm-control>=1.0.14
+pyquaternion
+
+# Real-robot setup, teleoperation and local/remote wrobo model inference
+# Install the published LeRobot package from PyPI, not a local source directory.
+# feetech selects the SO101 motor SDK, pyserial and deepdiff.
+# grpcio-dep selects LeRobot's gRPC transport; hardware/async/all extras are
+# unnecessary for wrobo's deployment entry points.
+#
+# wrobo loads its own trained policies through the Trainer registry; LeRobot
+# supplies registered hardware drivers, processors and RPC chunk transport.
+lerobot[feetech,grpcio-dep]==0.6.1
+
+# Explicit runtime constraints, aligned with the published LeRobot package:
+# Shared configuration (local hardware and remote inference)
+draccus>=0.11.6,<0.12.0
+# Robot computer only: serial discovery, calibration and Feetech motors
+pyserial>=3.5,<4.0
+deepdiff>=7.0.1,<9.0.0
+feetech-servo-sdk>=1.0.0,<2.0.0
+# Collection: arrow-key press/release events in a local graphical session
+pynput>=1.7.7,<2.0.0
+# Remote inference: required on both robot client and compute server
+grpcio>=1.73.1,<2.0.0
+protobuf>=6.31.1,<8.0.0

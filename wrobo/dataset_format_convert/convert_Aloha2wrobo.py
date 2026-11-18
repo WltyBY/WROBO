@@ -3,7 +3,7 @@ import h5py
 
 import numpy as np
 
-from wrobo.utils.vis import print_h5_structure
+from wrobo.tools.vis_trajectory import print_h5_structure
 from wrobo.utils.image_codec import create_image_dataset
 
 
@@ -78,7 +78,7 @@ def convert_hdf5_format(
 
 if __name__ == "__main__":
     comment = "sim_transfer_cube_compressed"
-    img_encoding = "png"  # "raw" (legacy) | "png" (lossless) | "jpg" (lossy, smallest)
+    img_encoding = "png"  # "gzip" (dense gzip'd) | "png" (lossless) | "jpeg" (lossy, smallest)
     jpeg_quality = 95
     folder_path = "./Dataset/ACT/sim_transfer_cube_scripted/"
     saved_folder = f"./Dataset/ACT_wrobo/{comment}/"
@@ -87,21 +87,25 @@ if __name__ == "__main__":
         for f in os.listdir(folder_path)
         if f.endswith(".hdf5") and f.startswith("episode_")
     ]
+
+    # Create target directory structure: episodes/ subdirectory for trajectory files
     os.makedirs(saved_folder, exist_ok=True)
+    episodes_dir = os.path.join(saved_folder, "episodes")
+    os.makedirs(episodes_dir, exist_ok=True)
 
     print_h5_structure(file_path_lst[0])
     for file in file_path_lst:
         convert_hdf5_format(
             file,
-            os.path.join(saved_folder, os.path.basename(file)),
+            os.path.join(episodes_dir, os.path.basename(file)),
             comment,
             img_encoding=img_encoding,
             jpeg_quality=jpeg_quality,
         )
 
     saved_file_path_lst = [
-        os.path.join(saved_folder, f)
-        for f in os.listdir(saved_folder)
+        os.path.join(episodes_dir, f)
+        for f in os.listdir(episodes_dir)
         if f.endswith(".hdf5") and f.startswith("episode_")
     ]
     print_h5_structure(saved_file_path_lst[0])

@@ -67,7 +67,8 @@ class FrozenBatchNorm2d(nn.Module):
 
 class ResNetBackBone(nn.Module):
     def __init__(
-        self, backbone_name, backbone_weights_name=None, return_interm_layers=False, dilation=False
+        self, backbone_name, backbone_weights_name=None, freeze_bn=True,
+        return_interm_layers=False, dilation=False, load_pretrained=True
     ):
         super().__init__()
         assert backbone_name.lower() in [
@@ -79,7 +80,9 @@ class ResNetBackBone(nn.Module):
         ], f"Unsupported backbone name: {backbone_name}"
         self.backbone_name = backbone_name
         self.backbone_weights_name = backbone_weights_name
+        self.freeze_bn = freeze_bn
         self.dilation = dilation
+        self.load_pretrained = load_pretrained
 
         if return_interm_layers:
             return_layers = {"layer1": "1", "layer2": "2", "layer3": "3", "layer4": "4"}
@@ -100,22 +103,30 @@ class ResNetBackBone(nn.Module):
         weight_name = self.backbone_weights_name
         weight_name = weight_name.upper() if weight_name is not None else None
 
+        # The configured weights determine the training architecture. Rebuilding
+        # from a checkpoint can skip their download while retaining FrozenBN.
+        use_frozen_bn = self.freeze_bn and (weight_name is not None)
+
+        if not use_frozen_bn and weight_name is None:
+            print(f"⚠️  No pretrained weights specified, using trainable BatchNorm instead of FrozenBatchNorm")
+
+        norm_layer = FrozenBatchNorm2d if use_frozen_bn else nn.BatchNorm2d
+
         # load pretrained weights if specified
         # note: new version of torchvision uses 'weights' instead of 'pretrained' argument,
         # but we want to maintain compatibility with older versions
         try:
             backbone = backbone_fn(
-                weights=weight_name,
+                weights=weight_name if self.load_pretrained else None,
                 replace_stride_with_dilation=[False, False, self.dilation],
-                pretrained=is_main_process(),
-                norm_layer=FrozenBatchNorm2d,
+                norm_layer=norm_layer,
             )
         except TypeError:
             # For old version of torchvision
             backbone = backbone_fn(
                 replace_stride_with_dilation=[False, False, self.dilation],
-                pretrained=weight_name is not None and is_main_process(),
-                norm_layer=FrozenBatchNorm2d,
+                pretrained=self.load_pretrained and weight_name is not None and is_main_process(),
+                norm_layer=norm_layer,
             )
 
         return backbone

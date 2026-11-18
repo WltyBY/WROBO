@@ -5,6 +5,8 @@ import numpy as np
 from typing import Optional
 from torch import Tensor, nn
 
+from wrobo.methods.ACT.models.dimensions import resolve_act_dimensions
+
 ACTIVATION_FUNCTIONS = {
     "relu": nn.ReLU,
     "gelu": nn.GELU,
@@ -391,13 +393,15 @@ class DETRVAE(nn.Module):
         activation="relu",
         pre_norm=False,
         return_intermediate_decoder=False,
+        action_dim=None,
     ):
         super().__init__()
-        self.proprio_dim = proprio_dim
+        self.proprio_dim, self.action_dim = resolve_act_dimensions(proprio_dim, action_dim)
         self.env_dim = env_dim
         self.z_dim = z_dim
         self.action_chunk_size = action_chunk_size
         self.return_intermediate_decoder = return_intermediate_decoder
+        activation = activation.lower()
 
         self.encoder = TransformerEncoder(
             num_layers=num_encoder_layers,
@@ -448,7 +452,7 @@ class DETRVAE(nn.Module):
 
         # encoder extra parameters
         self.encoder_action_proj = nn.Linear(
-            self.proprio_dim, embed_dim
+            self.action_dim, embed_dim
         )  # project action to embedding
         self.encoder_proprio_proj = nn.Linear(
             self.proprio_dim, embed_dim
@@ -482,13 +486,13 @@ class DETRVAE(nn.Module):
         self.action_chunk_embed = nn.Embedding(action_chunk_size, embed_dim)
         if self.return_intermediate_decoder:
             self.action_heads = nn.ModuleList(
-                [nn.Linear(embed_dim, proprio_dim) for _ in range(num_decoder_layers)]
+                [nn.Linear(embed_dim, self.action_dim) for _ in range(num_decoder_layers)]
             )
             self.is_pad_heads = nn.ModuleList(
                 [nn.Linear(embed_dim, 1) for _ in range(num_decoder_layers)]
             )
         else:
-            self.action_head = nn.Linear(embed_dim, proprio_dim)
+            self.action_head = nn.Linear(embed_dim, self.action_dim)
             self.is_pad_head = nn.Linear(embed_dim, 1)
 
     def reparametrize(self, mu, logvar):
@@ -496,22 +500,20 @@ class DETRVAE(nn.Module):
         eps = torch.randn_like(std)
         return mu + std * eps
 
-    def forward(self, image, proprio_state, env_state, actions=None, is_pad=None):
+    def forward(self, image, proprio_state, env_state, actions=None, is_pad=None, camera_names=None):
         """
-        image: list of tensors (len=num_cam), each [batch, history_width, C, H, W]
-            or (batch, num_cam, history_width, C, H, W) for backward compatibility
+        image: dict of {camera_name: tensor [batch, history_width, C, H, W]}
         proprio_state: batch, his_width, proprio_dim
         env_state: None or batch, history_width, env_dim (if backbone is None)
         actions: batch, seq, action_dim
+        camera_names: list of camera names present in this batch
         """
-        if isinstance(image, list):
-            num_cam = len(image)
-            bs, his_width, *_ = image[0].shape
-            image_list = image
-        else:
-            # if image in (batch, num_cam, history_width, C, H, W)
-            bs, num_cam, his_width, *_ = image.shape
-            image_list = [image[:, i] for i in range(num_cam)]
+        if camera_names is None:
+            camera_names = list(image.keys())
+
+        image_list = [image[name] for name in camera_names]
+        num_cam = len(camera_names)
+        bs, his_width, *_ = image_list[0].shape
 
         ################# VAE Encoder forward #################
         # Prepare style variable z
@@ -610,10 +612,11 @@ class DETRVAE(nn.Module):
 
                 pos = pos + t_embed
 
-                # Camera-view embedding, bound to the view name (constant across
-                # time and spatial location, unique per view).
+                # Camera-view embedding: now use the actual camera name from camera_names
+                # instead of self.camera_names[cam_id], so we correctly match the embedding
+                # even when cameras are dropped or reordered.
                 if self.cam_embed is not None:
-                    view_name = self.camera_names[cam_id]
+                    view_name = camera_names[cam_id]  # Use actual camera name passed in
                     cam_e = self.cam_embed[view_name].weight[0][
                         None, None, :, None, None
                     ]  # (1, 1, embed_dim, 1, 1)  # broadcast over bs, time, spatial
@@ -702,7 +705,7 @@ class DETRVAE(nn.Module):
                 c_pos_embed=pos,
             )[0]
 
-        # (num_layers, batch_size, seq_de, embed_dim) -> (num_layers, batch_size, seq_de, proprio_dim)
+        # (num_layers, batch_size, seq_de, embed_dim) -> (..., action_dim)
         if self.return_intermediate_decoder:
             a_hat = [self.action_heads[i](h) for i, h in enumerate(hs)]
             is_pad_hat = [self.is_pad_heads[i](h) for i, h in enumerate(hs)]

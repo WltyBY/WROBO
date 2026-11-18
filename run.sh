@@ -1,49 +1,37 @@
-PYTHONPATH=. python wrobo/methods/ACT/train.py \
-    --dataset_dir ./Dataset/ACT_wrobo/sim_transfer_stack_cube \
+PYTHONPATH=. python wrobo/methods/PI0/train.py \
+    --dataset_dir \
+        ./LIBERO/libero_spatial \
+        ./LIBERO/libero_object \
+        ./LIBERO/libero_goal \
+        ./LIBERO/libero_10 \
     --log_dir ./Logs \
-    --config_file ./Config/ACT.yaml \
-    --method_name transfer_stack_top \
-    -f 0 \
-    --num_epoch 300 \
-    --batch_size 8
-PYTHONPATH=. python wrobo/envs/Aloha/eval.py \
-    --log_dir ./Logs/transfer_stack_top/BS_8_EPOCH_300_SEED_319_PRETRAINED_False/w_KL_10.0/fold_0 \
-    --config_file ACT.yaml \
-    --task_name sim_transfer_stack_cube \
-    --num_rollouts 50 \
+    --config_file ./Config/PI0_LIBERO_VLAP.yaml \
+    --method_name PI0_LIBERO_VLAP \
     --gpu 0 \
-    --temporal_agg
-PYTHONPATH=. python wrobo/envs/Aloha/eval.py \
-    --log_dir ./Logs/transfer_stack_top/BS_8_EPOCH_300_SEED_319_PRETRAINED_False/w_KL_10.0/fold_0 \
-    --config_file ACT.yaml \
-    --task_name sim_transfer_stack_cube \
-    --num_rollouts 50 \
-    --gpu 0
-PYTHONPATH=. python wrobo/envs/Aloha/eval.py \
-    --log_dir ./Logs/transfer_stack_top/BS_8_EPOCH_300_SEED_319_PRETRAINED_False/w_KL_10.0/fold_0 \
-    --config_file ACT.yaml \
-    --task_name sim_transfer_stack_cube \
-    --num_rollouts 50 \
-    --gpu 0 \
-    --temporal_agg \
-    --ckpt_name checkpoint_final.pth
-PYTHONPATH=. python wrobo/envs/Aloha/eval.py \
-    --log_dir ./Logs/transfer_stack_top/BS_8_EPOCH_300_SEED_319_PRETRAINED_False/w_KL_10.0/fold_0 \
-    --config_file ACT.yaml \
-    --task_name sim_transfer_stack_cube \
-    --num_rollouts 50 \
-    --gpu 0 \
-    --ckpt_name checkpoint_final.pth
+    --fold all \
+    --num_epoch 120 \
+    --warmup_epoch 4 \
+    --batch_size 16 \
+    --gradient_accumulation_steps 2 \
+    --merge_norm_stats \
+    --compile
 
 
 ####  DDP  ####
-# PYTHONPATH=. torchrun --nproc_per_node=2 wrobo/methods/ACT/train.py \
-#     --dataset_dir ./Dataset/ACT_wrobo/sim_transfer_stack_cube \
-#     --log_dir ./Logs \
-#     --config_file ./Config/ACT.yaml \
-#     --method_name transfer_stack_top \
-#     -f 0 \
-#     --num_epoch 300 \
-#     --batch_size 64 \
-#     --gpu 0,1 \
-#     --do_compile
+PYTHONPATH=. torchrun --nproc_per_node=2 wrobo/methods/PI0/train.py \
+    --dataset_dir \
+        ./LIBERO/libero_spatial \
+        ./LIBERO/libero_object \
+        ./LIBERO/libero_goal \
+        ./LIBERO/libero_10 \
+    --log_dir ./Logs \
+    --config_file ./Config/PI0_LIBERO_VLAP.yaml \
+    --method_name PI0_LIBERO_VLAP \
+    --gpu 0,1 \
+    --fold all \
+    --num_epoch 120 \
+    --warmup_epoch 4 \
+    --batch_size 32 \
+    --gradient_accumulation_steps 1 \
+    --merge_norm_stats \
+    --compile
